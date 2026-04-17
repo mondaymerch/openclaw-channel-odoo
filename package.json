@@ -1,0 +1,44 @@
+{
+  "name": "openclaw-channel-odoo",
+  "version": "0.1.0",
+  "description": "OpenClaw channel plugin for Odoo — route AI conversations through Odoo's chatter via XML-RPC",
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "tsc --noEmit"
+  },
+  "openclaw": {
+    "extensions": ["./dist/index.js"],
+    "channel": {
+      "id": "odoo",
+      "label": "Odoo",
+      "blurb": "Connect OpenClaw to Odoo chatter for AI-powered conversations on any record.",
+      "order": 60
+    }
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-channel",
+    "odoo",
+    "odoo-chatter",
+    "xml-rpc"
+  ],
+  "license": "MIT",
+  "author": "Monday Merch B.V.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mondaymerch/openclaw-channel-odoo"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.3.24"
+  },
+  "dependencies": {
+    "xmlrpc": "^1.3.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "openclaw": ">=2026.3.24"
+  }
+}

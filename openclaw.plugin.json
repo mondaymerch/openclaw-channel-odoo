@@ -1,0 +1,57 @@
+{
+  "id": "odoo",
+  "kind": "channel",
+  "channels": ["odoo"],
+  "name": "Odoo",
+  "description": "Route AI conversations through Odoo chatter via XML-RPC",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "odoo": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "url": {
+            "type": "string",
+            "description": "Odoo instance URL (e.g. https://myodoo.com)"
+          },
+          "db": {
+            "type": "string",
+            "description": "Odoo database name"
+          },
+          "uid": {
+            "type": "number",
+            "description": "Odoo user ID for XML-RPC authentication"
+          },
+          "password": {
+            "type": "string",
+            "description": "Odoo API key or password for XML-RPC"
+          },
+          "webhookSecret": {
+            "type": "string",
+            "description": "Shared secret for verifying inbound webhooks from Odoo (Bearer token)"
+          },
+          "allowFrom": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Odoo user IDs allowed to send messages"
+          },
+          "webhookPath": {
+            "type": "string",
+            "description": "HTTP path the plugin registers for inbound messages from Odoo (e.g. /odoo/chatter)"
+          },
+          "replyMethod": {
+            "type": "string",
+            "description": "Odoo model method to call for posting AI replies (e.g. openclaw_post_reply)"
+          },
+          "replyArgs": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Ordered list of argument names to pass. Available: body, requestMessageId, model, resId"
+          }
+        },
+        "required": ["url", "db", "uid", "password", "webhookSecret", "webhookPath", "replyMethod", "replyArgs"]
+      }
+    }
+  }
+}

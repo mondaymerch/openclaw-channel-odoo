@@ -78,7 +78,6 @@ export class OdooClient {
    *
    * Available variable names: body, requestMessageId, model, resId
    *
-   * Default: openclaw_post_reply([resId], body, requestMessageId)
    */
   async callReply(params: CallReplyParams): Promise<any> {
     const { model, resId, method, argNames } = params;
@@ -90,6 +89,27 @@ export class OdooClient {
     };
     const args = [[resId], ...argNames.map((name) => argMap[name])];
     return this.executeKw(model, method, args);
+  }
+
+  /**
+   * Search and read records from any Odoo model.
+   *
+   * This wraps the standard ORM `search_read` method, available on
+   * every model since Odoo 8. Used by the agent tool to fetch
+   * conversation history, record details, linked records, etc.
+   */
+  async searchRead(params: {
+    model: string;
+    domain: any[];
+    fields?: string[];
+    limit?: number;
+    order?: string;
+  }): Promise<any[]> {
+    return this.executeKw(params.model, "search_read", [params.domain], {
+      fields: params.fields ?? [],
+      limit: params.limit ?? 20,
+      order: params.order ?? "id desc",
+    });
   }
 
   /**

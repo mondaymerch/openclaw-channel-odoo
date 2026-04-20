@@ -97,6 +97,10 @@ export const odooPlugin = createChatChannelPlugin<ResolvedOdooAccount>({
       capabilities: {
         chatTypes: ["direct" as const],
       },
+      status: {
+        // Webhook-based channel — no persistent socket to monitor
+        skipStaleSocketHealthCheck: true,
+      },
     },
   ),
 

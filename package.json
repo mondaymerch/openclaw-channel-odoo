@@ -4,6 +4,16 @@
   "description": "OpenClaw channel plugin for Odoo — route AI conversations through Odoo's chatter via XML-RPC",
   "type": "module",
   "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
@@ -18,6 +28,10 @@
       "label": "Odoo",
       "blurb": "Connect OpenClaw to Odoo chatter for AI-powered conversations on any record.",
       "order": 60
+    },
+    "install": {
+      "npmSpec": "openclaw-channel-odoo",
+      "defaultChoice": "npm"
     }
   },
   "keywords": [

@@ -23,6 +23,7 @@ export interface ResolvedOdooAccount {
   webhookSecret: string;
   webhookPath: string;
   allowFrom: string[];
+  botSessionId: string | null;
   replyMethod: string;
   replyArgs: string[];
 }
@@ -67,6 +68,7 @@ export function resolveAccount(
     webhookSecret: section.webhookSecret ?? "",
     webhookPath: section.webhookPath,
     allowFrom: section.allowFrom ?? [],
+    botSessionId: section.botSessionId ?? null,
     replyMethod: section.replyMethod,
     replyArgs: section.replyArgs,
   };

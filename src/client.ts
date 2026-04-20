@@ -22,6 +22,7 @@ export interface CallReplyParams {
   requestMessageId: number;
   method: string;
   argNames: string[];
+  botSessionId?: string | null;
 }
 
 export class OdooClient {
@@ -88,7 +89,11 @@ export class OdooClient {
       resId: params.resId,
     };
     const args = [[resId], ...argNames.map((name) => argMap[name])];
-    return this.executeKw(model, method, args);
+    const kwargs: Record<string, any> = {};
+    if (params.botSessionId) {
+      kwargs.context = { bot_session_id: params.botSessionId };
+    }
+    return this.executeKw(model, method, args, kwargs);
   }
 
   /**

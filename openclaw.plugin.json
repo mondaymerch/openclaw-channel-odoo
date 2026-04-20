@@ -40,6 +40,10 @@
             "type": "string",
             "description": "HTTP path the plugin registers for inbound messages from Odoo (e.g. /odoo/chatter)"
           },
+          "botSessionId": {
+            "type": "string",
+            "description": "Bot session ID passed in XML-RPC context (if required by some Odoo module)"
+          },
           "replyMethod": {
             "type": "string",
             "description": "Odoo model method to call for posting AI replies (e.g. openclaw_post_reply)"

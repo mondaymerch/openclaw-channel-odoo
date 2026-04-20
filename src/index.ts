@@ -161,6 +161,7 @@ const entry: any = defineChannelPluginEntry({
                   requestMessageId: message_id,
                   method: account.replyMethod,
                   argNames: account.replyArgs,
+                  botSessionId: account.botSessionId,
                 });
               },
               onError: (err: unknown) => {

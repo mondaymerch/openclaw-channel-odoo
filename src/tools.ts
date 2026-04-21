@@ -32,7 +32,8 @@ function getToolClient(cfg: OpenClawConfig): OdooClient {
 
 export function createOdooSearchReadTool(cfg: OpenClawConfig) {
   // Validate config at registration time
-  resolveAccount(cfg);
+  const registeredAccount = resolveAccount(cfg);
+  const botSessionId = registeredAccount.botSessionId;
 
   return () => ({
     name: "odoo_search_read",
@@ -91,6 +92,7 @@ export function createOdooSearchReadTool(cfg: OpenClawConfig) {
         fields: params.fields,
         limit: params.limit,
         order: params.order,
+        botSessionId,
       });
 
       return {

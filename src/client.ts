@@ -109,12 +109,17 @@ export class OdooClient {
     fields?: string[];
     limit?: number;
     order?: string;
+    botSessionId?: string | null;
   }): Promise<any[]> {
-    return this.executeKw(params.model, "search_read", [params.domain], {
+    const kwargs: Record<string, any> = {
       fields: params.fields ?? [],
       limit: params.limit ?? 20,
       order: params.order ?? "id desc",
-    });
+    };
+    if (params.botSessionId) {
+      kwargs.context = { bot_session_id: params.botSessionId };
+    }
+    return this.executeKw(params.model, "search_read", [params.domain], kwargs);
   }
 
   /**

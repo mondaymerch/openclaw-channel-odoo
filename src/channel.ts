@@ -12,6 +12,7 @@ import {
   createChannelPluginBase,
 } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
+import { runStoppablePassiveMonitor } from "openclaw/plugin-sdk/extension-shared";
 import { OdooClient, type OdooConfig } from "./client.js";
 
 export interface ResolvedOdooAccount {
@@ -100,6 +101,18 @@ export const odooPlugin = createChatChannelPlugin<ResolvedOdooAccount>({
       status: {
         // Webhook-based channel — no persistent socket to monitor
         skipStaleSocketHealthCheck: true,
+      },
+      gateway: {
+        // Webhook-based channel has no runtime lifecycle of its own. Without a
+        // startAccount, the channel never enters "running" state, so the gateway
+        // health monitor keeps restarting it every 60s with reason "stopped".
+        // A trivial passive monitor keeps `running: true` until shutdown.
+        startAccount: async (ctx: { abortSignal: AbortSignal }) => {
+          await runStoppablePassiveMonitor({
+            abortSignal: ctx.abortSignal,
+            start: async () => ({ stop: () => {} }),
+          });
+        },
       },
     },
   ),

@@ -1,6 +1,6 @@
 {
   "name": "openclaw-channel-odoo",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "OpenClaw channel plugin for Odoo — receive webhooks and reply via configurable XML-RPC methods",
   "type": "module",
   "main": "./dist/index.js",

@@ -42,7 +42,7 @@ function getClient(config: OdooConfig): OdooClient {
   return client;
 }
 
-function resolveOdooSection(cfg: OpenClawConfig): Record<string, any> | undefined {
+export function resolveOdooSection(cfg: OpenClawConfig): Record<string, any> | undefined {
   return (cfg.channels as Record<string, any>)?.["odoo"];
 }
 

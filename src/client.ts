@@ -8,6 +8,8 @@
 // @ts-ignore — xmlrpc has no type declarations
 import xmlrpc from "xmlrpc";
 
+import type { KwargValue } from "./channel.js";
+
 export interface OdooConfig {
   url: string;
   db: string;
@@ -22,6 +24,7 @@ export interface CallReplyParams {
   requestMessageId: number;
   method: string;
   argNames: string[];
+  kwargs?: Record<string, KwargValue>;
   botSessionId?: string | null;
 }
 
@@ -75,10 +78,11 @@ export class OdooClient {
    * Call a configurable reply method on an Odoo record.
    *
    * The first positional arg is always [resId] (Odoo convention).
-   * Remaining args are built from argNames in order, mapped to available variables.
+   * Remaining positional args are built from argNames (each resolved against
+   * argMap). kwargs entries are resolved per KwargValue (ref → argMap lookup,
+   * literal → passed through as-is).
    *
    * Available variable names: body, requestMessageId, model, resId
-   *
    */
   async callReply(params: CallReplyParams): Promise<any> {
     const { model, resId, method, argNames } = params;
@@ -88,11 +92,31 @@ export class OdooClient {
       model: params.model,
       resId: params.resId,
     };
-    const args = [[resId], ...argNames.map((name) => argMap[name])];
+
+    const resolveVar = (name: string): any => {
+      if (!(name in argMap)) {
+        throw new Error(`odoo: unknown variable "${name}" at call time`);
+      }
+      return argMap[name];
+    };
+
+    const args = [[resId], ...argNames.map(resolveVar)];
+
     const kwargs: Record<string, any> = {};
-    if (params.botSessionId) {
-      kwargs.context = { bot_session_id: params.botSessionId };
+    for (const [key, spec] of Object.entries(params.kwargs ?? {})) {
+      kwargs[key] = spec.kind === "ref" ? resolveVar(spec.name) : spec.value;
     }
+
+    if (params.botSessionId) {
+      // Merge bot_session_id into context without clobbering a user-supplied
+      // context object — user keys stay, we add our one field.
+      const existingContext =
+        kwargs.context && typeof kwargs.context === "object" && !Array.isArray(kwargs.context)
+          ? (kwargs.context as Record<string, any>)
+          : {};
+      kwargs.context = { ...existingContext, bot_session_id: params.botSessionId };
+    }
+
     return this.executeKw(model, method, args, kwargs);
   }
 

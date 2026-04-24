@@ -44,17 +44,62 @@
             "type": "string",
             "description": "Bot session ID passed in XML-RPC context (if required by some Odoo module)"
           },
-          "replyMethod": {
-            "type": "string",
-            "description": "Odoo model method to call for posting AI replies (e.g. openclaw_post_reply)"
-          },
-          "replyArgs": {
+          "routes": {
             "type": "array",
-            "items": { "type": "string" },
-            "description": "Ordered list of argument names to pass. Available: body, requestMessageId, model, resId"
+            "minItems": 1,
+            "description": "Ordered per-model routing rules. First match wins. The last entry must be a catchall (match: \"*\").",
+            "items": {
+              "type": "object",
+              "properties": {
+                "match": {
+                  "oneOf": [
+                    { "type": "string", "enum": ["*"] },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "model": {
+                          "type": "string",
+                          "description": "Odoo model name or glob (e.g. \"crm.lead\", \"helpdesk.*\", \"*.lead\"). Only \"*\" is supported as a glob metacharacter."
+                        }
+                      },
+                      "required": ["model"],
+                      "additionalProperties": false
+                    }
+                  ]
+                },
+                "agentId": {
+                  "type": "string",
+                  "description": "Optional agent id for inbound routing. Overrides SDK binding resolution for messages that hit this route."
+                },
+                "reply": {
+                  "type": "object",
+                  "description": "How to post the agent's reply back to Odoo.",
+                  "properties": {
+                    "method": {
+                      "type": "string",
+                      "description": "Odoo method name to invoke via XML-RPC execute_kw."
+                    },
+                    "args": {
+                      "type": "array",
+                      "items": { "type": "string" },
+                      "description": "Ordered variable names to pass as positional args after the implicit [resId]. Available: body, requestMessageId, model, resId."
+                    },
+                    "kwargs": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "Keyword args for the call. String values starting with $ (e.g. \"$body\") are references to the variable namespace; $$ escapes a literal $. Other values (strings, numbers, booleans, arrays, objects) are passed as literals."
+                    }
+                  },
+                  "required": ["method"],
+                  "additionalProperties": false
+                }
+              },
+              "required": ["match", "reply"],
+              "additionalProperties": false
+            }
           }
         },
-        "required": ["url", "db", "uid", "password", "webhookSecret", "webhookPath", "replyMethod", "replyArgs"]
+        "required": ["url", "db", "uid", "password", "webhookSecret", "webhookPath", "routes"]
       }
     }
   }

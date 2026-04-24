@@ -77,6 +77,12 @@ export function createDispatchBatch(deps: {
         MessageSids: messageIds,
         MessageSidFirst: messageIds[0],
         MessageSidLast: messageIds[messageIds.length - 1],
+        // Carries the triggering message_id through to
+        // attachedResults.sendText (→ ctx.replyToId), which passes it as
+        // requestMessageId in the XML-RPC callback. Without this, Odoo's
+        // openclaw_post_reply receives 0, skips the tracking flip and bus
+        // notification, and the user's panel never refreshes.
+        ReplyToId: String(last.message_id),
         Timestamp: Date.now(),
         OriginatingChannel: CHANNEL_ID,
         OriginatingTo: recordAddress,

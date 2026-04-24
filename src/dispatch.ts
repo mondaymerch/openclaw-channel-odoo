@@ -5,7 +5,17 @@
  */
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
-import { getClient, type ResolvedOdooAccount } from "./channel.js";
+import {
+  buildAgentSessionKey,
+  buildAgentMainSessionKey,
+  deriveLastRoutePolicy,
+  sanitizeAgentId,
+} from "openclaw/plugin-sdk/routing";
+import {
+  findRouteForModel,
+  getClient,
+  type ResolvedOdooAccount,
+} from "./channel.js";
 import type { OdooConfig } from "./client.js";
 import { getOdooRuntime } from "./runtime.js";
 
@@ -50,12 +60,37 @@ export function createDispatchBatch(deps: {
       const rt = getOdooRuntime();
       const cfg = api.config;
 
-      const route = rt.channel.routing.resolveAgentRoute({
+      const matched = findRouteForModel(account.routes, model);
+
+      let route = rt.channel.routing.resolveAgentRoute({
         cfg,
         channel: CHANNEL_ID,
         accountId: ACCOUNT_ID,
         peer: { kind: "direct", id: peerId },
       });
+
+      // Per-route agentId override — mirrors the Telegram topic-agent pattern
+      // (see telegram bot-Ch7__EHu.js:663-689). We rebuild the sessionKey from
+      // the override agent so downstream session records are scoped correctly.
+      if (matched.agentId) {
+        const agentId = sanitizeAgentId(matched.agentId);
+        const sessionKey = buildAgentSessionKey({
+          agentId,
+          channel: CHANNEL_ID,
+          accountId: ACCOUNT_ID,
+          peer: { kind: "direct", id: peerId },
+          dmScope: cfg.session?.dmScope,
+          identityLinks: cfg.session?.identityLinks,
+        });
+        const mainSessionKey = buildAgentMainSessionKey({ agentId });
+        route = {
+          ...route,
+          agentId,
+          sessionKey,
+          mainSessionKey,
+          lastRoutePolicy: deriveLastRoutePolicy({ sessionKey, mainSessionKey }),
+        };
+      }
 
       const recordAddress = `${CHANNEL_ID}:record:${peerId}`;
 
@@ -125,8 +160,9 @@ export function createDispatchBatch(deps: {
               resId: res_id,
               body: text,
               requestMessageId: last.message_id,
-              method: account.replyMethod,
-              argNames: account.replyArgs,
+              method: matched.reply.method,
+              argNames: matched.reply.args,
+              kwargs: matched.reply.kwargs,
               botSessionId: account.botSessionId,
             });
           },

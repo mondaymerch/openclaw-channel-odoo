@@ -28,7 +28,7 @@ An [OpenClaw](https://openclaw.dev) channel plugin that wires OpenClaw agents in
 Install via OpenClaw:
 
 ```bash
-openclaw install openclaw-channel-odoo
+openclaw plugins install openclaw-channel-odoo
 ```
 
 Minimal `openclaw.json`:

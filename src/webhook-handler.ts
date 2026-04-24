@@ -32,12 +32,17 @@ export function createWebhookHandler(deps: {
     };
 
     // Re-read per request so hot-reloaded secrets take effect without restart.
+    // resolveAccount enforces webhookSecret is set at config-load time, but we
+    // re-check here because config can be hot-reloaded and we must never
+    // accept an unauthenticated webhook.
     const secret = resolveOdooSection(api.config)?.webhookSecret;
-    if (secret) {
-      const authHeader = req.headers.authorization ?? "";
-      if (authHeader !== `Bearer ${secret}`) {
-        return respond(401, { error: "Unauthorized" });
-      }
+    if (!secret) {
+      api.logger.error("[odoo] webhookSecret missing from config — rejecting");
+      return respond(503, { error: "Channel not configured" });
+    }
+    const authHeader = req.headers.authorization ?? "";
+    if (authHeader !== `Bearer ${secret}`) {
+      return respond(401, { error: "Unauthorized" });
     }
 
     const parsed = await readJsonBodyWithLimit(req, {

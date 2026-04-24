@@ -57,6 +57,9 @@ export function resolveAccount(
   if (!section?.webhookPath) {
     throw new Error("odoo: webhookPath is required in channels.odoo");
   }
+  if (!section?.webhookSecret) {
+    throw new Error("odoo: webhookSecret is required in channels.odoo");
+  }
   if (!section?.replyMethod || !section?.replyArgs) {
     throw new Error("odoo: replyMethod and replyArgs are required in channels.odoo");
   }
@@ -66,7 +69,7 @@ export function resolveAccount(
     db: section.db,
     uid: section.uid,
     password: section.password,
-    webhookSecret: section.webhookSecret ?? "",
+    webhookSecret: section.webhookSecret,
     webhookPath: section.webhookPath,
     allowFrom: section.allowFrom ?? [],
     botSessionId: section.botSessionId ?? null,

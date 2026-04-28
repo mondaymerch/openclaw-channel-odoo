@@ -13,6 +13,7 @@ If you just want a one-paragraph overview, see the [README](../README.md).
 - [Routes](#routes)
 - [The `reply` spec](#the-reply-spec)
 - [Variables and refs](#variables-and-refs)
+- [What the agent sees on inbound](#what-the-agent-sees-on-inbound)
 - [`args` vs `kwargs`](#args-vs-kwargs--which-do-i-use)
 - [Worked examples](#worked-examples)
 - [Validation errors](#validation-errors)
@@ -373,6 +374,77 @@ It's useful to see what your config becomes at each stage:
 ```
 
 The `kind` tags are internal scaffolding — Odoo never sees them.
+
+---
+
+## What the agent sees on inbound
+
+When a message arrives on the Odoo channel and gets dispatched to an agent, the plugin prepends a single-line header to the prompt body so the agent has a deterministic signal that it's on Odoo (vs Slack, etc.) and knows which record + which user the message is about.
+
+### Header format
+
+```
+[odoo] model=<model> res_id=<id> user="<name>" partner_id=<id>
+
+<original message body>
+```
+
+Field rules:
+
+| Field | Source | Always present? | Type / encoding |
+|---|---|---|---|
+| `model` | `model` from inbound webhook | Yes | bare token (e.g. `crm.lead`, `sale.order.line`) |
+| `res_id` | `res_id` from inbound | Yes | integer |
+| `user` | `user_name` from inbound | Optional — omitted if absent or empty | quoted; embedded `"` and `\` escaped via backslash |
+| `partner_id` | `partner_id` from inbound | Optional — omitted if absent | integer |
+
+Examples:
+
+```
+[odoo] model=crm.lead res_id=1234 user="Alice Wong" partner_id=5
+
+create a quote, 2 weeks validity please
+```
+
+```
+[odoo] model=helpdesk.ticket res_id=99 partner_id=7
+
+Why is this ticket still open?
+```
+
+```
+[odoo] model=sale.order res_id=42
+
+<body>
+```
+
+### What the header is NOT
+
+- It is **not** prepended to `Body` / `RawBody` / `CommandBody` — only to `BodyForAgent`. The other fields feed dedup, command stripping, and directive resolution and must stay raw
+- It is **not** outbound — the agent's reply goes back to Odoo unchanged; the header is only on the way in
+
+### Opting out per route
+
+Routes that don't need the header (e.g. one-shot button-triggered actions, routes that supply their own prompt context elsewhere) can opt out:
+
+```jsonc
+{
+  "match": { "model": "crm.lead" },
+  "agentId": "quote-drafter",
+  "promptHeader": false,
+  "reply": { "method": "create_quote", "args": ["body"] }
+}
+```
+
+Default is `true`. Validation: must be a boolean if present, else `routes[N].promptHeader: must be a boolean when present`.
+
+### Using the header in agent system prompts
+
+A typical AGENTS.md / `systemPromptOverride` snippet that uses this header:
+
+> *"When the inbound starts with a line like `[odoo] model=<model> res_id=<id> ...`, you're being invoked from the Odoo channel. Extract `<model>` and `<id>` to feed `odoo_search_read` if you need to load conversation history or inspect the record. If a `user="<name>"` field is present, address that user by name."*
+
+The header format is stable across the plugin — agents can rely on the leading `[odoo]` token and `key=value` pairs.
 
 ---
 

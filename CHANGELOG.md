@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (pre-1.0: minor bumps may contain breaking changes).
 
+## [0.3.1] — Unreleased
+
+### Added
+
+- **Inbound prompt header on `BodyForAgent`.** Every dispatched message is now prefixed with a single-line header carrying the Odoo channel id, record reference, and (when supplied by the inbound webhook) the user's name and partner id. Format: `[odoo] model=<model> res_id=<id> user="<name>" partner_id=<id>`. Lets agent system prompts deterministically detect Odoo inbounds and address the user by name. Header touches only `BodyForAgent` — `Body` / `RawBody` / `CommandBody` stay raw to keep dedup/command logic unaffected.
+- **`promptHeader` route field.** Optional boolean per route, default `true`. Set `false` to skip the inbound header for routes that don't need it (e.g. one-shot button-triggered actions or routes that supply their own prompt context).
+
 ## [0.3.0] — 2026-04-24
 
 ### Breaking

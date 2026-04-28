@@ -41,6 +41,35 @@ export type PluginApi = {
   };
 };
 
+/**
+ * Build a single-line header that gets prepended to BodyForAgent so the
+ * agent can deterministically detect it's on the Odoo channel and pull the
+ * record reference + sender info without an extra tool call.
+ *
+ * Only added when the matched route has promptHeader=true (default).
+ */
+function formatChannelHeader(params: {
+  model: string;
+  resId: number;
+  userName?: string;
+  partnerId?: number;
+}): string {
+  const parts = [
+    `[${CHANNEL_ID}]`,
+    `model=${params.model}`,
+    `res_id=${params.resId}`,
+  ];
+  const trimmedName = params.userName?.trim();
+  if (trimmedName) {
+    const escaped = trimmedName.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    parts.push(`user="${escaped}"`);
+  }
+  if (params.partnerId !== undefined && Number.isInteger(params.partnerId)) {
+    parts.push(`partner_id=${params.partnerId}`);
+  }
+  return parts.join(" ");
+}
+
 export function createDispatchBatch(deps: {
   api: PluginApi;
   account: ResolvedOdooAccount;
@@ -94,9 +123,22 @@ export function createDispatchBatch(deps: {
 
       const recordAddress = `${CHANNEL_ID}:record:${peerId}`;
 
+      // Prepend a single-line channel/sender header to BodyForAgent only.
+      // Body / RawBody / CommandBody stay raw — they feed dedup, command
+      // stripping, and directive resolution, all of which must not see
+      // plugin-injected content.
+      const bodyForAgent = matched.promptHeader
+        ? `${formatChannelHeader({
+            model,
+            resId: res_id,
+            userName: last.user_name,
+            partnerId: last.partner_id,
+          })}\n\n${combinedBody}`
+        : combinedBody;
+
       const ctx = rt.channel.reply.finalizeInboundContext({
         Body: combinedBody,
-        BodyForAgent: combinedBody,
+        BodyForAgent: bodyForAgent,
         RawBody: combinedBody,
         CommandBody: combinedBody,
         From: `${CHANNEL_ID}:partner:${last.partner_id}`,

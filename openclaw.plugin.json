@@ -71,6 +71,10 @@
                   "type": "string",
                   "description": "Optional agent id for inbound routing. Overrides SDK binding resolution for messages that hit this route."
                 },
+                "promptHeader": {
+                  "type": "boolean",
+                  "description": "Whether to prepend a single-line `[odoo] model=… res_id=… user=… partner_id=…` header to the agent prompt for inbounds matching this route. Default: true."
+                },
                 "reply": {
                   "type": "object",
                   "description": "How to post the agent's reply back to Odoo.",

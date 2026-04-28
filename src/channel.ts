@@ -41,6 +41,11 @@ export type CompiledRoute = {
   match: RouteMatch;
   agentId?: string;
   reply: CompiledReply;
+  /**
+   * Whether to prepend a single-line `[odoo] model=… res_id=… user=… partner_id=…`
+   * header to the agent prompt for inbounds matching this route. Defaults to true.
+   */
+  promptHeader: boolean;
   source: string;
 };
 
@@ -172,7 +177,7 @@ export function compileRoutes(raw: unknown): CompiledRoute[] {
     if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
       throw new Error(`odoo: ${routePath}: must be an object`);
     }
-    const { match, agentId, reply } = entry as Record<string, unknown>;
+    const { match, agentId, reply, promptHeader } = entry as Record<string, unknown>;
 
     let agent: string | undefined;
     if (agentId !== undefined) {
@@ -182,10 +187,15 @@ export function compileRoutes(raw: unknown): CompiledRoute[] {
       agent = agentId;
     }
 
+    if (promptHeader !== undefined && typeof promptHeader !== "boolean") {
+      throw new Error(`odoo: ${routePath}.promptHeader: must be a boolean when present`);
+    }
+
     out.push({
       match: compileMatch(match, routePath),
       agentId: agent,
       reply: compileReply(reply, routePath),
+      promptHeader: promptHeader === undefined ? true : promptHeader,
       source: routePath,
     });
   });

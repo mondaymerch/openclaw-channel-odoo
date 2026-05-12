@@ -22,6 +22,7 @@ export interface CallReplyParams {
   resId: number;
   body: string;
   requestMessageId: number;
+  routingKey?: string;
   method: string;
   argNames: string[];
   kwargs?: Record<string, KwargValue>;
@@ -82,7 +83,7 @@ export class OdooClient {
    * argMap). kwargs entries are resolved per KwargValue (ref → argMap lookup,
    * literal → passed through as-is).
    *
-   * Available variable names: body, requestMessageId, model, resId
+   * Available variable names: body, requestMessageId, model, resId, routingKey
    */
   async callReply(params: CallReplyParams): Promise<any> {
     const { model, resId, method, argNames } = params;
@@ -91,6 +92,7 @@ export class OdooClient {
       requestMessageId: params.requestMessageId,
       model: params.model,
       resId: params.resId,
+      routingKey: params.routingKey,
     };
 
     const resolveVar = (name: string): any => {

@@ -12,7 +12,7 @@ import {
   sanitizeAgentId,
 } from "openclaw/plugin-sdk/routing";
 import {
-  findRouteForModel,
+  findRouteForInbound,
   getClient,
   type ResolvedOdooAccount,
 } from "./channel.js";
@@ -27,6 +27,7 @@ export type InboundMessage = {
   res_id: number;
   body: string;
   message_id: number;
+  routing_key?: string;
   user_name?: string;
   partner_id?: number;
 };
@@ -51,6 +52,7 @@ export type PluginApi = {
 function formatChannelHeader(params: {
   model: string;
   resId: number;
+  routingKey?: string;
   userName?: string;
   partnerId?: number;
 }): string {
@@ -59,6 +61,11 @@ function formatChannelHeader(params: {
     `model=${params.model}`,
     `res_id=${params.resId}`,
   ];
+  const routingKey = params.routingKey?.trim();
+  if (routingKey) {
+    const escaped = routingKey.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    parts.push(`routing_key="${escaped}"`);
+  }
   const trimmedName = params.userName?.trim();
   if (trimmedName) {
     const escaped = trimmedName.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
@@ -89,7 +96,10 @@ export function createDispatchBatch(deps: {
       const rt = getOdooRuntime();
       const cfg = api.config;
 
-      const matched = findRouteForModel(account.routes, model);
+      const matched = findRouteForInbound(account.routes, {
+        model,
+        routingKey: last.routing_key,
+      });
 
       let route = rt.channel.routing.resolveAgentRoute({
         cfg,
@@ -131,6 +141,7 @@ export function createDispatchBatch(deps: {
         ? `${formatChannelHeader({
             model,
             resId: res_id,
+            routingKey: last.routing_key,
             userName: last.user_name,
             partnerId: last.partner_id,
           })}\n\n${combinedBody}`
@@ -202,6 +213,7 @@ export function createDispatchBatch(deps: {
               resId: res_id,
               body: text,
               requestMessageId: last.message_id,
+              routingKey: last.routing_key,
               method: matched.reply.method,
               argNames: matched.reply.args,
               kwargs: matched.reply.kwargs,

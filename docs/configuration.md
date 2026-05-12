@@ -221,10 +221,11 @@ That's all the XML-RPC you need to know to configure this plugin.
 
 ## Routes
 
-`routes` is an ordered list of per-model rules. When an inbound message arrives on `crm.lead:1234`, the plugin walks the list top-down and **uses the first rule whose `match` accepts `"crm.lead"`**.
+`routes` is an ordered list of rules. When an inbound message arrives, the plugin walks the list top-down and uses the first rule whose `match` accepts either the message routing key or its Odoo model.
 
 ```jsonc
 "routes": [
+  { "match": "purchase.receipt.scheduled_date_response", "agentId": "purchase-scheduled-date", "reply": { "method": "scheduled_date_response", "args": ["body", "requestMessageId"] } },
   { "match": { "model": "crm.lead" },   "reply": { "method": "summarise_lead",  "args": ["body"] } },
   { "match": { "model": "helpdesk.*" }, "reply": { "method": "post_ai_note",    "args": ["body"] } },
   { "match": "*",                        "reply": { "method": "message_post",    "kwargs": { "body": "$body", "message_type": "comment" } } }
@@ -234,10 +235,13 @@ That's all the XML-RPC you need to know to configure this plugin.
 ### Match syntax
 
 - `"*"` — catchall, matches anything
+- `"<routing-key-pattern>"` — routing key or glob. Odoo sends this as `routing_key` or `routingKey` in the webhook payload
+- `{ "routingKey": "<pattern>" }` — explicit routing key match. `{ "routing_key": "<pattern>" }` is also accepted
 - `{ "model": "<pattern>" }` — model name or glob. The only glob metacharacter is `*` (no `?`, no regex, no brace expansion)
 
 Glob examples:
 - `"crm.lead"` — exact match
+- `"purchase.receipt.*"` — any routing key starting with `purchase.receipt.`
 - `"helpdesk.*"` — anything starting with `helpdesk.`
 - `"*.lead"` — anything ending with `.lead`
 - `"sale.order.*"` — anything starting with `sale.order.`
@@ -247,7 +251,7 @@ Glob examples:
 
 - `routes` is required and non-empty
 - The **last entry** must be `match: "*"` (catchall) — enforced at config load. No silent drops if nothing matches
-- First match wins. A later, more-specific rule will never fire if an earlier broader one captures the model first — order your list specific → general
+- First match wins. A later, more-specific rule will never fire if an earlier broader one captures the routing key or model first — order your list specific → general
 
 ### Per-route agent override (optional)
 
@@ -303,7 +307,7 @@ env["crm.lead"].browse([1234]).<method>(<body value>)
 
 ## Variables and refs
 
-When the agent replies, the plugin builds a fixed namespace of **four variables**, called the `argMap`:
+When the agent replies, the plugin builds a fixed namespace, called the `argMap`:
 
 | Variable | Value |
 |---|---|
@@ -311,6 +315,7 @@ When the agent replies, the plugin builds a fixed namespace of **four variables*
 | `requestMessageId` | The id of the inbound message that triggered this reply (integer — the `message_id` your controller sent in the webhook payload) |
 | `model` | The Odoo model the reply is going to (e.g. `"crm.lead"`) |
 | `resId` | The record id (e.g. `1234`) |
+| `routingKey` | The inbound routing key, if supplied |
 
 References in `args` and `kwargs` resolve against this namespace at call time.
 
@@ -384,7 +389,7 @@ When a message arrives on the Odoo channel and gets dispatched to an agent, the 
 ### Header format
 
 ```
-[odoo] model=<model> res_id=<id> user="<name>" partner_id=<id>
+[odoo] model=<model> res_id=<id> routing_key="<routing_key>" user="<name>" partner_id=<id>
 
 <original message body>
 ```
@@ -395,6 +400,7 @@ Field rules:
 |---|---|---|---|
 | `model` | `model` from inbound webhook | Yes | bare token (e.g. `crm.lead`, `sale.order.line`) |
 | `res_id` | `res_id` from inbound | Yes | integer |
+| `routing_key` | `routing_key` / `routingKey` from inbound | Optional — omitted if absent or empty | quoted; embedded `"` and `\` escaped via backslash |
 | `user` | `user_name` from inbound | Optional — omitted if absent or empty | quoted; embedded `"` and `\` escaped via backslash |
 | `partner_id` | `partner_id` from inbound | Optional — omitted if absent | integer |
 
@@ -658,9 +664,9 @@ Config is validated at startup. All errors are fail-fast with a path pointing at
 | `odoo: replyMethod/replyArgs are removed — configure channels.odoo.routes instead` | Using deprecated top-level config | Move to `routes` (see [examples](#worked-examples)) |
 | `odoo: routes: required non-empty array in channels.odoo` | `routes` missing or empty | Add at least one route, with catchall last |
 | `odoo: routes: last entry must be { match: "*" } (catchall) — got routes[N]` | No catchall at end of list | Append `{ "match": "*", "reply": {...} }` |
-| `odoo: routes[N].match: must be "*" or { model: "<glob>" }` | Invalid match shape | Check syntax |
+| `odoo: routes[N].match: must be "*", "<routing-key-glob>", { model: "<glob>" }, or { routingKey: "<glob>" }` | Invalid match shape | Check syntax |
 | `odoo: routes[N].reply.method: required non-empty string` | Missing/empty method name | Fix the method field |
-| `odoo: routes[N].reply.args[M]: unknown variable "<name>"` | Typo in a variable ref | Must be one of `body`, `requestMessageId`, `model`, `resId` |
+| `odoo: routes[N].reply.args[M]: unknown variable "<name>"` | Typo in a variable ref | Must be one of `body`, `requestMessageId`, `model`, `resId`, `routingKey` |
 | `odoo: routes[N].reply.kwargs.<key>: unknown variable "$<name>"` | Typo in a `$`-prefixed kwarg ref | Same allowlist as above. If you wanted a literal `$foo`, escape with `$$foo` |
 
 ---

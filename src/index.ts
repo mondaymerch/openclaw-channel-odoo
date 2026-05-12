@@ -61,7 +61,7 @@ const entry: any = defineChannelPluginEntry({
 
     const debouncer = createInboundDebouncer<InboundMessage>({
       debounceMs: INBOUND_DEBOUNCE_MS,
-      buildKey: (item) => `${item.model}:${item.res_id}`,
+      buildKey: (item) => `${item.model}:${item.res_id}:${item.routing_key ?? ""}`,
       onFlush: dispatchBatch,
       onError: (err, items) => {
         const key = items[0] ? `${items[0].model}:${items[0].res_id}` : "?";

@@ -17,7 +17,7 @@ An [OpenClaw](https://openclaw.dev) channel plugin that wires OpenClaw agents in
 - 🪝 **Inbound**: any Odoo trigger → agent (auth'd, deduped, debounced)
 - 📤 **Outbound**: agent output → any Odoo method, configurable per model
 - 🔍 **Tool**: `odoo_search_read` — the agent reads Odoo data on demand
-- 🎯 **Per-model routing**: different methods, agents, prompts per Odoo record type
+- 🎯 **Route matching**: send different Odoo events to different methods, agents, or prompts by model or routing key
 
 > **Heads up** — the plugin is one half of the integration. You also need a small Odoo-side addon (an HTTP controller that POSTs to the webhook, and the method(s) the plugin calls back into). See the [Odoo-side setup](docs/configuration.md#odoo-side-setup) section of the configuration guide for a copy-paste minimal example.
 

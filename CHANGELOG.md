@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (pre-1.0: minor bumps may contain breaking changes).
 
+## [0.3.2] — 2026-05-12
+
+### Added
+
+- **Routing-key route matching.** Inbound webhook payloads may now include `routing_key` or `routingKey`; routes can match this with a string glob (`"purchase.receipt.*"`) or `{ "routingKey": "..." }`. Model-based route matching remains supported.
+- **Routing key in Odoo prompt headers and reply variables.** The Odoo header includes `routing_key="..."` when supplied, and reply `args` / `kwargs` may reference `routingKey`.
+
 ## [0.3.1] — 2026-04-28
 
 ### Added

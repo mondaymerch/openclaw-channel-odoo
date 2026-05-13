@@ -4,6 +4,44 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (pre-1.0: minor bumps may contain breaking changes).
 
+## [0.4.0-beta] — 2026-05-13
+
+Pre-release. Installs only via `npm install openclaw-channel-odoo@beta`; the stable `latest` dist-tag continues to point at 0.3.1.
+
+### Added
+
+- **Persistent inbox.** At-least-once delivery for inbound Odoo chatter messages, surviving gateway restarts (OOM, deploy, SIGKILL). The webhook handler persists each message to disk before returning 202; a three-state on-disk machine (`received` / `dispatching` / `reply_ready`) feeds messages through the agent + XML-RPC delivery pipeline with boot-time crash recovery. Eliminates the silent-loss path where a gateway restart between webhook ACK and dispatch completion would drop messages.
+
+  Architecture highlights:
+  - One file per debounce batch under `{stateDir}/odoo-inbound-queue/`; atomic writes (tmp + rename) via the openclaw plugin SDK.
+  - `markDispatching` is a real CAS (state `received → dispatching`) under a per-record promise-chain mutex — two concurrent `processBatch` calls for the same batchKey serialize, one wins.
+  - `recordFailure` flips `dispatching → received` so post-failure batches are appendable again AND boot recovery routes them through the correct backoff bucket (30s/120s retry timing, not a 15-min staleness defer).
+  - Boot recovery partitions on-disk state in a single pass into six buckets (`expired` / `eligibleReplyReady` / `deferred` / `notYetEligibleReceived` / `eligibleReceived` / `corrupt`) plus stale-`dispatching` normalization via `recordFailure(internal_error)`.
+  - Webhook handler returns 503 (and rolls back the in-memory dedup mark) on persist failure — Odoo's retry succeeds cleanly without silent loss.
+  - Migration normalizer reshapes legacy on-disk JSON on read; idempotent, rolling-deploy safe.
+
+  See [`persistent-inbox-spec.md`](persistent-inbox-spec.md) for the as-built design, state-machine diagram, data model, scheduler/recovery semantics, and the full list of known limitations.
+
+- **New `src/inbox/*` modules** — `types`, `record-lock`, `store`, `queue` (facade: `appendOrCreateBatch` / `markDispatching` / `transitionToReplyReady` / `recordFailure` / `recordDeliverySuccess` / `moveBatchToFailed`), `scheduler` (retries + caps), `recovery` (boot partition). `src/dispatch.ts` is refactored around `createDispatchHandler.processBatch` as the **sole batch-handler entry point** — debouncer onFlush, scheduler retry timer, and boot recovery all converge there. New `src/debouncer-adapter.ts` bridges the in-memory debouncer flush to disk-backed `processBatch`.
+
+- **136 tests across 8 files** — `record-lock`, `store`, `queue`, `scheduler`, `recovery`, `dispatch`, `webhook-handler`, `debouncer-adapter`. Run with `npx tsx --test tests/*.test.ts`.
+
+### CI
+
+- **Pre-release dist-tag routing in `publish.yml`.** Detects the semver pre-release suffix (any version containing `-`, e.g. `0.4.0-beta`, `1.0.0-rc.1`) and publishes with `npm publish --tag beta`. Stable releases continue to publish to the default `latest` dist-tag. Cutting a beta no longer overwrites the stable channel.
+
+### Known limitations (deferred)
+
+Documented in detail in the spec's "Known limitations" section. Headline items:
+
+- Hard-timeout late-deliver double-post (CAS prevents double agent runs; XML-RPC delivery dedup still relies on Odoo-side `requestMessageId` idempotency; bounded by `DISPATCH_MAX_ATTEMPTS`).
+- Deferred fresh-`dispatching` timer fires into a defensive no-op — batch stays in `dispatching` until TTL expiry on the next boot.
+- Per-record serialization depends on openclaw's `queueMode === "collect"` default (which chains parallel batches as ordered follow-up runs). Don't change `queueMode` for the `odoo` channel without re-evaluating.
+- `reply_ready` ignores backoff on restart and never expires by TTL.
+- Raw process crash mid-`callReply` doesn't bump `deliveryAttempts`.
+- Recovery's stale-`dispatching` normalize bypasses the dispatch cap by one (effective MAX+1 in that path).
+- No fallback chatter post on cap exhaustion; no graceful-shutdown hook.
+
 ## [0.3.1] — 2026-04-28
 
 ### Added

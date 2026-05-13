@@ -1,341 +1,335 @@
-# openclaw-channel-odoo — Persistent Inbox Spec
+# openclaw-channel-odoo — Persistent Inbox
 
-## Goal
+**Status:** as-built documentation. This file describes what the persistent-inbox feature *is* in the codebase, not what was originally planned. For the rationale behind specific design choices, see commit history.
 
-At-least-once delivery for inbound Odoo chatter messages, surviving gateway restarts (OOM, deploy, SIGKILL). Eliminate silent message loss.
+## Purpose
 
-## Non-goals
+The persistent inbox provides at-least-once delivery for inbound Odoo chatter messages, surviving gateway restarts (OOM, deploy, SIGKILL). The webhook handler persists each inbound message to disk *before* returning 202 to Odoo; a state-machine on those files survives across process boundaries and feeds them through the agent + XML-RPC delivery pipeline.
 
-- **Exactly-once delivery** — accepted as a v1 limitation: retries on `reply_ready` can in theory produce duplicate chatter posts if Odoo's response is ambiguous (network reset between Odoo's commit and our receipt). Plumbing for the fix is included now (see "Idempotency key") — closing it requires a small Odoo-addon change that's deferred to v2.
-- **In-process agent recovery** — we don't try to resume a half-run agent turn. Restarted runs start fresh from the inbound message.
-- **Changes to openclaw core** — pure plugin-side implementation using `@openclaw/fs-safe/store` primitives.
+Single-gateway / single-PID assumption holds throughout. Cross-instance coordination is out of scope (the per-record lock is in-process only).
 
-## On-disk state machine
+## Module map
 
 ```
-   ┌──────────┐  agent produces reply   ┌──────────────┐  XML-RPC ok
-   │ received │ ──────────────────────► │  reply_ready │ ─────────────►  (unlinked)
-   └──────────┘     (text saved)        └──────────────┘
-        ↻                                       ↻
-   silent / internal_error / timeout      XML-RPC fail
-   (dispatchAttempts++, cap 3)            (deliveryAttempts++, cap 5)
-        │                                       │
-        ├── cap hit                             └── cap hit ──┐
-        └── enqueuedAt + 1h (TTL) ──┐                         │
-                                    ▼                         ▼
-                  ┌──────────────────────────────────────────────┐
-                  │            {queueDir}/failed/                 │
-                  │       (fallback chatter post fires)           │
-                  └──────────────────────────────────────────────┘
+src/
+├── inbox/
+│   ├── types.ts          — InboxBatch shape, MessageState, constants
+│   ├── record-lock.ts    — Per-key promise-chain mutex
+│   ├── store.ts          — File CRUD + path resolution + migration normalizer
+│   ├── queue.ts          — Facade: appendOrCreateBatch, markDispatching, etc.
+│   ├── scheduler.ts      — In-memory retry timer + cap enforcement
+│   └── recovery.ts       — Boot-time disk-state partitioning
+├── dispatch.ts           — createDispatchHandler — the SOLE batch handler
+├── webhook-handler.ts    — HTTP handler: persist-before-ACK
+├── debouncer-adapter.ts  — Bridges in-memory debouncer flush → processBatch
+└── index.ts              — Plugin wiring: constructs lock, queue, scheduler, handler, debouncer; runs boot recovery
 ```
 
-Three on-disk states plus one terminal:
-- `received` — webhook captured, no reply produced yet. Self-loops on dispatch failure until either `dispatchAttempts` hits 3 or the 1-hour TTL elapses → `failed/`.
-- `reply_ready` — agent produced text, XML-RPC not yet confirmed. Self-loops on XML-RPC failure until `deliveryAttempts` hits 5 → `failed/`. **No TTL** — the agent's text is sunk cost; we deliver it eventually.
-- `failed/` — terminal, moved aside, fallback chatter post fires (best-effort).
-- *(unlinked)* — success terminal. File simply removed from disk.
+The architectural invariant: **`processBatch` (in `dispatch.ts`) is the sole entry point that handles batch lifecycle.** Three trigger paths converge on it — debouncer onFlush adapter, scheduler retry timer fire, boot recovery scheduling — and nothing else touches batch state machinery directly.
 
-The only forward inter-state transition is `received → reply_ready` (when our `deliver` callback fires and we checkpoint the reply text). Everything else is a self-loop on the same state or an exit to `failed/` / unlinked.
+## State machine
 
-### Why `reply_ready` is its own state
+Three on-disk states plus one terminal directory:
 
-The file is **not** part of the in-process retry mechanism — in-process XML-RPC retries use an in-memory `setTimeout` loop and don't need disk. The `reply_ready` file is purely a **checkpoint for crash-survival**: it preserves the agent's already-produced text so that if the gateway dies mid-delivery, recovery can re-attempt XML-RPC without re-running the agent (which would burn tokens and risk producing different text, potentially a duplicate visible reply if the prior XML-RPC actually succeeded).
+```
+    appendOrCreateBatch
+            │ (initial)
+            ▼
+       ┌──────────┐ markDispatching (CAS)  ┌─────────────┐ transitionToReplyReady ┌──────────────┐ recordDeliverySuccess
+       │ received │ ─────────────────────► │ dispatching │ ─────────────────────► │ reply_ready  │ ─────────────────────► (unlinked)
+       └──────────┘                        └─────────────┘                        └──────────────┘
+            ▲                                     │ recordFailure                       │ recordFailure (xmlrpc)
+            │                                     │ (silent / internal_error)           │ (state unchanged; counter bumps)
+            │                                     ▼                                     │
+            └──── recordFailure flips back to "received" ──────────────────────────────┘
+                                                                                        │ cap exhausted
+            cap exhausted (dispatchAttempts ≥ 3)                                        │ (deliveryAttempts ≥ 5)
+                  OR TTL expired (≥ 1h, non-reply_ready only)                           │
+                                                                                        ▼
+                                                                            ┌──────────────────────┐
+                                                                            │ {queueDir}/failed/   │  terminal
+                                                                            └──────────────────────┘
+```
 
-Concretely, the file gets written:
-1. **Once** at the `received` → `reply_ready` transition (inside our `deliver` callback, before the first `callReply` attempt)
-2. **Updated** after each failed `callReply` (to bump `deliveryAttempts`, set `lastAttemptAt`, record `lastError`) so a crash mid-retry-loop produces a correct restart state
-3. **Unlinked** on `callReply` success
+| State | Meaning | Appendable by new webhooks? |
+|---|---|---|
+| `received` | Persisted, not currently being dispatched. Either fresh, or in backoff after a prior failure. | **Yes** — `findOpenBatchForRecord` returns it |
+| `dispatching` | Agent run in flight. Set atomically by `markDispatching`'s CAS. `inFlightSince` is non-null. | No — new webhook creates a parallel batch |
+| `reply_ready` | Agent produced text (saved to disk); XML-RPC delivery pending or in retry. | No |
 
-This is the same conservative pattern openclaw uses in its outbound delivery queue.
+The whole point of `dispatching` as a distinct state (rather than a flag): the per-record lock + state-CAS gives a real atomic "transition received → dispatching" with no extra primitive needed. Two concurrent `processBatch` calls for the same batchKey both call `markDispatching`; one wins (`{ ok: true }`), the other loses (`{ ok: false, reason: "not_received" }`) and returns early.
+
+The whole point of `recordFailure` flipping `dispatching` → `received` on failure: post-failure batches are appendable again (so a new webhook during backoff joins the existing batch) AND boot recovery routes them through the backoff bucket (so the 30s/120s retry timing isn't accidentally extended to 15 min).
+
+## Data model
+
+`InboxBatch` (`src/inbox/types.ts`):
+
+```ts
+type MessageState = "received" | "dispatching" | "reply_ready";
+
+type InboxBatch = {
+  batchKey: string;          // UUID; matches the filename stem
+  state: MessageState;
+  model: string;             // e.g. "crm.lead"
+  res_id: number;
+  messages: InboundMessage[];
+
+  enqueuedAt: Timestamp;     // when the batch was OPENED (first message arrived)
+  closedAt: Timestamp | null;      // set ONCE on first markDispatching; never cleared
+  inFlightSince: Timestamp | null; // set by markDispatching; cleared by
+                                   // recordFailure + transitionToReplyReady.
+                                   // Invariant: non-null ⇔ state === "dispatching"
+
+  dispatchAttempts: number;        // silent + internal_error counter; cap = 3
+  deliveryAttempts: number;        // xmlrpc_failure counter; cap = 5
+  lastAttemptAt: Timestamp | null; // wall-clock of the most recent recordFailure
+  lastError: string | null;
+  lastFailureClass: FailureClass | null;  // "silent" | "internal_error" | "xmlrpc_failure"
+
+  reply: { text: string; producedAt: Timestamp } | null;  // populated on transitionToReplyReady
+};
+```
+
+Field roles, all single-purpose:
+
+- **`state`** answers "what phase of the lifecycle is this batch in?" Three values, each with distinct routing in `processBatch`, `recovery`, and `findOpenBatchForRecord`.
+- **`closedAt`** answers "has this batch ever been dispatched?" Set once on the first `markDispatching` (`queue.ts`'s CAS); never cleared, never re-written. Useful for diagnostics + future readers; no current control-flow path keys off it directly.
+- **`inFlightSince`** answers "if state is dispatching, when did it start?" Used by boot recovery to compute the staleness boundary (`now - inFlightSince < AGENT_RUN_TIMEOUT_MS` → defer; else normalize).
+- **`dispatchAttempts`** / **`deliveryAttempts`** count classified failures (in the JS catch). Caps are enforced in `scheduler.handleFailure` via `nextAction`.
+- **`lastAttemptAt`** anchors the next eligible retry time (`lastAttemptAt + backoff[counter-1]`).
+
+`Reply.producedAt` is diagnostic; `messages[].receivedAt` is diagnostic.
 
 ## File layout
 
+One file per debounce batch (not per `message_id`):
+
 ```
 {stateDir}/odoo-inbound-queue/
-├── <message_id>.json              # active entries (state: received | reply_ready)
-├── <message_id>.json.tmp.<n>      # atomic-write temp files
+├── <sanitizedModel>__<res_id>__<batchKey>.json              # active (state: received | dispatching | reply_ready)
+├── <sanitizedModel>__<res_id>__<batchKey>.json.<rand>.tmp   # atomic-write temp files
 └── failed/
-    └── <message_id>.json          # terminal failures
+    └── <sanitizedModel>__<res_id>__<batchKey>.json          # terminal failures
 ```
 
-File content (rough):
+- `stateDir` is `$OPENCLAW_STATE_DIR` / `$OPENCLAW_HOME/.openclaw` / `~/.openclaw` (in priority order, `store.ts: resolveStateDir`).
+- `sanitizedModel` replaces `/` and `\` with `_` defensively.
+- Atomic writes go through `writeJsonFileAtomically` (tmp + rename, mode 0o600, ensureDirMode 0o700). Page-cache-atomic but not power-loss-durable — accepted; cloud-VM power loss is rare enough that per-write `fsync` overhead isn't justified.
 
-```json
-{
-  "id": "<uuid>",
-  "state": "received | reply_ready",
-  "message_id": 741,
-  "model": "crm.lead",
-  "res_id": 106665,
-  "body": "...",
-  "user_name": "Sila",
-  "partner_id": 5432,
-  "enqueuedAt": 1715201234567,
-  "idempotencyKey": "741",         // stable per entry; see "Idempotency key"
+The filename prefix lets `findOpenBatchForRecord` narrow candidates via `readdir + string prefix match` before touching any file contents.
 
-  "dispatchedAt": null,            // set when handoff to dispatchReplyWithBufferedBlockDispatcher starts; cleared on resolution
-  "dispatchAttempts": 0,
-  "deliveryAttempts": 0,
-  "lastAttemptAt": null,
-  "lastError": null,
-  "lastFailureClass": null,        // "silent" | "internal_error" | "xmlrpc_failure"
+## Concurrency model
 
-  "reply": { "text": "...", "producedAt": ... }    // only when state=reply_ready
-}
-```
+**Per-record promise-chain mutex** (`record-lock.ts`). Keyed on `${model}:${res_id}`. The lock is per-process and in-memory. All read-modify-write operations on a batch file go through `lock.withLock(key, fn)`.
 
-Use `writeJsonDurableQueueEntry` from `@openclaw/fs-safe/store` for atomic writes.
+The lock is taken individually by each facade method in `queue.ts`:
+- `appendOrCreateBatch` (the full dedup + lookup + write)
+- `markDispatching` (the full CAS read-check-write)
+- `transitionToReplyReady`
+- `recordDeliverySuccess`
+- `recordFailure`
+- `moveBatchToFailed`
 
-## Fault model assumptions
+`processBatch` does NOT hold an outer lock across the entire dispatch flow. Between facade calls (e.g. between `markDispatching` and the agent dispatch await), the lock is released. The CAS on state is what prevents two concurrent `processBatch` invocations from both running the agent for the same batchKey: the loser sees `state !== "received"` and exits early.
 
-The durability claims in this spec hold against the following fault model. Violations of these assumptions are out of scope.
+Per-record lock is also taken by `appendOrCreateBatch`, so a webhook arriving mid-dispatch sees the in-progress `state === "dispatching"` and either creates a parallel batch (if no open one exists) or appends to a sibling open batch (the post-failure backoff case).
 
-- **Atomic writes are page-cache-atomic, not power-loss-durable.** Each entry is written via `<file>.tmp.<random>` + `rename`, which is POSIX-atomic against concurrent observers and survives any process-level crash (SIGKILL, OOM, deploy restart). No `fsync` is called on the file or directory, so a kernel panic, hard reboot, or actual power loss within the OS's writeback window (typically 5–30s) can lose the last few writes. We accept this — process crashes are the common failure mode this spec targets, and cloud-VM power loss is rare enough not to justify per-write fsync overhead. If stronger durability is needed later, expose a `fsync: true` plugin-config option.
-- **Timestamps are wall-clock (`Date.now()`).** Both `enqueuedAt` and `dispatchedAt` are wall-clock millis, compared at recovery time against a fresh `Date.now()`. Backwards NTP slews are benign — they cause over-deferral, not under-recovery. Large forward jumps (e.g., container with bad initial clock that NTP corrects upward after first dispatch) could prematurely flip a fresh `dispatchedAt` marker to stale, firing a parallel retry. Practical NTP jitter is sub-second; only pathological clock failures (manual `date -s`, VM resume with very stale clock) cross the 15-minute `AGENT_RUN_TIMEOUT_MS` threshold. We use wall-clock because cross-process timestamp comparisons (boot recovery vs. previous-process dispatch) require it — `process.hrtime.bigint()` resets per process and can't bridge restarts.
+## Webhook flow
 
-## Where it plugs into existing plugin code
+`webhook-handler.ts` — invoked by openclaw plugin SDK for `account.webhookPath`.
 
-| Existing code | Change |
-|---|---|
-| `webhook-handler.ts` (before `respond(202, ...)`) | Write `received` file. ACK only after write succeeds. |
-| `dispatch.ts` (before `await dispatchReplyWithBufferedBlockDispatcher(...)`) | Atomically set `dispatchedAt = now` on the file(s) in the batch. |
-| `dispatch.ts` (around the `deliver` callback) | Wrap `deliver`: write `reply_ready` with text BEFORE invoking `callReply`. On XML-RPC success → unlink. On XML-RPC failure → leave file, schedule retry. |
-| `dispatch.ts` (after `dispatchReplyWithBufferedBlockDispatcher` resolves) | Clear `dispatchedAt`. Inspect `DispatchFromConfigResult`: classify outcome, write back `lastFailureClass` + `lastError`, schedule retry. |
-| `index.ts` `registerFull` startup | Scan queue dir, replay pending files (`received` with no/stale `dispatchedAt` → debouncer; `received` with fresh `dispatchedAt` → defer until staleness; `reply_ready` → XML-RPC) |
-| `channel.ts` `startAccount` (currently empty `stop` callback) | Optional graceful-shutdown hook: write a per-record "replay-immediately" marker so on boot we don't wait. |
+1. **Auth** (`Bearer ${webhookSecret}`); 401 on mismatch.
+2. **Body parse** with `readJsonBodyWithLimit` (413/408/400 on size/timeout/parse).
+3. **Field validation** (`model`, `res_id`, `message_id`, `body`); 400 on missing.
+4. **Ready gate**: 503 if `isReady() === false` (boot recovery still running). Odoo retries 5xx, so no message is lost during the recovery window. Recovery typically completes in milliseconds when the queue dir is empty.
+5. **In-memory dedup**: `dedupe.check(String(message_id))`. If hit → 202 with `{duplicate: true}`. Two-minute TTL; covers Odoo's controller retry window.
+6. **Persist before ACK**: `queue.appendOrCreateBatch({ model, res_id, message_id, body, user_name, partner_id })`.
+   - `ok: true, didCreate: true | false` → 202 with `batchKey`
+   - `ok: false, reason: "duplicate"` → 202 with `{duplicate: true}` (disk-level dedup hit; the queue scans both `queueDir` and `failedDir` for the message_id)
+   - `ok: false, reason: "disk_error"` → 503 (Odoo retries)
+7. **Fire-and-forget debouncer**: `void debouncer.enqueue(item)`. Errors land in the debouncer's `onError` hook.
 
-## Retry classification
+The 202 ACK comes *after* a successful queue write. If we cannot persist, we never ACK — Odoo's retry budget covers transient disk hiccups.
 
-Two observable axes determine the next action:
+## Dispatch flow
 
-1. **Did our own `deliver` callback fire?** (we control it — we know directly)
-2. **What did `dispatchReplyWithBufferedBlockDispatcher`'s promise resolve to?** (`DispatchFromConfigResult`, or threw)
+`dispatch.ts` — `createDispatchHandler.processBatch(batch)`. Branches on `batch.state`:
 
-Classification table:
+### Branch 1: `reply_ready` — re-fire XML-RPC only, skip the agent
+
+The agent already produced text on a prior attempt; we just need to deliver it again.
+
+1. Refuse with `internal_error` if `batch.reply` is unexpectedly null.
+2. `postViaCallReply(...)` with the saved `batch.reply.text` and the *last* message_id in the batch as `requestMessageId`.
+3. On success: `queue.recordDeliverySuccess` unlinks the file.
+4. On throw: `scheduler.handleFailure(ref, "xmlrpc_failure", err)`. `recordFailure` bumps `deliveryAttempts`, leaves state at `reply_ready`, clears `inFlightSince` (already null). Scheduler schedules next retry per `DELIVERY_BACKOFF_MS`.
+
+### Branch 2: `received` — full dispatch via CAS
+
+1. **CAS**: `queue.markDispatching(ref)` reads under the per-record lock; if `state !== "received"` returns `{ ok: false, reason: "not_received" }`. The caller logs and returns — another path is already handling this batch.
+2. On `{ ok: true, batch }`: state is now `"dispatching"`, `inFlightSince = now()`, `closedAt` set if it wasn't already.
+3. **Agent dispatch**: route resolution + per-route agentId override + session record + `rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher` wrapped in `Promise.race` against `HARD_TIMEOUT_MS` (15 min).
+4. **Deliver callback**: when the agent produces text, our wrapped `deliver` runs `queue.transitionToReplyReady(ref, text)` (state → `"reply_ready"`, `reply.text` checkpointed, `inFlightSince` cleared), then `postViaCallReply`, then `queue.recordDeliverySuccess` (unlink). A `callReply` throw is caught and routed through `scheduler.handleFailure(ref, "xmlrpc_failure", err)`. `deliverOutcome` flag tracks whether deliver fired and how, so the outer race resolution doesn't double-classify.
+5. **Race resolution**:
+   - `{ kind: "timeout" }` with `deliverOutcome === null` → `handleFailure(internal_error)`. The original dispatch promise is left running; if its deliver eventually fires, it races against any retry.
+   - `{ kind: "resolved" }` with `deliverOutcome === null` → agent finished without producing text → `handleFailure(silent)`.
+   - `{ kind: "resolved" }` with `deliverOutcome` set → success or xmlrpc_failure already classified by deliver wrapper.
+6. **Outer catch**: any thrown error (route resolution, session record, unexpected agent runtime error) → `handleFailure(internal_error)`.
+
+### Branch 3: `dispatching` (defensive)
+
+Reached only via boot recovery's deferred-fresh-dispatching path (when the staleness-boundary timer fires). The defensive branch logs an error and returns without action — a known gap: see "Known limitations" below.
+
+### Branch 4 (default, never)
+
+Exhaustive `default` with `const _: never = batch.state` cast — TypeScript compile-error if a future state value is added without an explicit case.
+
+## Failure classification
+
+Two observable axes:
+
+1. Did our own `deliver` callback fire?
+2. What did the dispatch's promise resolve to?
 
 | Signal | Class | Counter | Cap |
 |---|---|---|---|
-| `deliver` called + our `callReply` succeeded | success | — | — (unlink) |
-| `deliver` called + our `callReply` threw | `xmlrpc_failure` | `deliveryAttempts` | 5 |
-| `deliver` NOT called + `queuedFinal: false` (clean resolution) | `silent` | `dispatchAttempts` | 3 |
-| Promise rejected (try/catch hit) OR dispatch timed out (see "Dispatch timeout") | `internal_error` | `dispatchAttempts` | 3 |
+| `deliver` fired + `callReply` succeeded | (success — unlinked, no record) | — | — |
+| `deliver` fired + `callReply` threw | `xmlrpc_failure` | `deliveryAttempts` | 5 |
+| `deliver` NOT fired + race resolved cleanly | `silent` | `dispatchAttempts` | 3 |
+| `Promise.race` returned `{ kind: "timeout" }` | `internal_error` | `dispatchAttempts` | 3 |
+| Outer try/catch (unexpected exception) | `internal_error` | `dispatchAttempts` | 3 |
 
-Notes:
-- On openclaw 2026.5.4 there is no `beforeAgentRunBlocked` signal — dispatch always proceeds. A "session busy" condition in PI runtime is handled internally by openclaw (abort + run-now, or enqueue-followup), not surfaced as a separate failure class. For codex/CLI agents there is no session lock at all. So no `blocked` row exists. A future openclaw version may introduce this signal; if so, add a row and a counter at that point.
-- `failedCounts` from `DispatchFromConfigResult` is **not used for control flow**. It's keyed by `ReplyDispatchKind = "tool" | "block" | "final"`; non-zero values typically reflect streaming chunk drops (`block`) which don't affect whether the final reply landed. Recorded in `lastError` for diagnostics only.
-- "Agent crashed" / "LLM provider down" don't have a dedicated class. They collapse into either `silent` (caught internally, no final produced) or `internal_error` (propagated as exception, or our plugin-side dispatch timeout fired) — both flow through the agent-retry bucket.
+## Scheduler
 
-## Backoff schedules
+`scheduler.ts` — in-memory `setTimeout` map keyed on `batchKey`.
 
-- **Dispatch retry (`silent` / `internal_error`)** — `[30s, 2min]`, cap 3 attempts → failed/
-- **Delivery retry (`xmlrpc_failure`)** — `[5s, 25s, 2min, 10min]`, cap 5 attempts → failed/ (matches openclaw outbound queue)
+Public surface:
+- `scheduleAt(batch, delayMs)` — re-arm a timer (cancels any prior timer for the same batchKey first).
+- `handleFailure(ref, failureClass, err)` — calls `queue.recordFailure`, then computes `nextAction`:
+  - If `counter < MAX` → `scheduleAt(updated, backoff[counter - 1])`.
+  - If `counter >= MAX` → `queue.moveBatchToFailed(ref)` and cancel any timer.
+- `cancelAll()` — for shutdown.
 
-## Plugin-reload safety (why this design is restart-tolerant)
+When a timer fires, the scheduler **re-reads the batch from disk** (`readBatch`) before invoking `processBatch(current)`. This re-read-before-fire pattern closes a race where the in-memory snapshot at schedule-time is stale (e.g., the batch was unlinked or moved to `failed/` while waiting).
 
-A common concern: if the plugin reloads (or its instance resets) while an agent is mid-run on a long inbound — 5-10 minutes of tool calls and analysis — won't boot recovery fire a retry, creating a parallel run that re-processes the same message?
+Timers are `.unref()`'d — they don't block process exit.
 
-**No.** The `dispatchedAt` marker prevents premature retries from boot recovery, and the plugin-side dispatch timeout (see "Dispatch timeout") guarantees that any in-flight dispatch resolves one way or another within `AGENT_RUN_TIMEOUT_MS`.
+## Boot recovery
 
-### Primary mechanism: `dispatchedAt` marker
+`recovery.ts` — `runBootRecovery({ paths, queue, scheduler, logger })` runs in an async IIFE in `index.ts` immediately after the queue + scheduler + dispatch handler are constructed, and *before* the webhook ready-gate flips.
 
-Right before our `dispatch.ts` awaits `dispatchReplyWithBufferedBlockDispatcher`, we atomically write `dispatchedAt = now` on the file. When the await resolves (any outcome — success, classified failure, or our hard timeout firing), we clear it.
+Partition pass (single iteration over `listBatches(paths)`):
 
-On boot recovery, for each `received` file:
-- `dispatchedAt` is null → never dispatched → retry normally
-- `dispatchedAt` is fresh (`now - dispatchedAt < AGENT_RUN_TIMEOUT_MS`) → assume the previous dispatch is still in flight → **skip retry**, schedule a re-check at `dispatchedAt + AGENT_RUN_TIMEOUT_MS`
-- `dispatchedAt` is stale → previous dispatch is presumed dead (process restarted, or our hard timeout fired and the dispatch was already retried under a fresh `dispatchedAt`) → retry
+1. **Expire** — `state !== "reply_ready" && now - enqueuedAt > REPLAY_TTL_MS` (1 h) → `moveBatchToFailed`, bump `summary.expired`.
+2. **eligibleReplyReady** — `state === "reply_ready"` → `scheduleAt(batch, 0)`. No stagger, no backoff respect, no TTL. Faster delivery is strictly better than letting a typed reply rot.
+3. **dispatching** — split by `inFlightSince` freshness:
+   - Fresh (`now - inFlightSince < AGENT_RUN_TIMEOUT_MS`) → `scheduleAt(batch, inFlightSince + 15min - now)`, bump `summary.deferred`. The previous process is presumed still running this dispatch; wait for the staleness boundary.
+   - Stale → call `queue.recordFailure(ref, "internal_error", "stale dispatching marker")` synchronously. This flips state back to `received`, bumps `dispatchAttempts`, clears `inFlightSince`, sets `lastAttemptAt = now()`. Then falls through to the received-path logic below. The counter bump gives gateway-flapping a real bound (`DISPATCH_MAX_ATTEMPTS = 3`).
+4. **received** — split by next-eligible-at:
+   - `lastAttemptAt + backoff[counter - 1] > now` → `scheduleAt(batch, residual)`, bump `summary.notYetEligibleReceived`.
+   - Otherwise → push to `eligibleReceived` for stagger pass.
+5. **Stagger** — `eligibleReceived[i]` scheduled at `i * REPLAY_STAGGER_MS` (200 ms cadence). Prevents dogpiling the agent concurrency lane on boot when many batches were left on disk.
+6. **Log summary** — single line with all bucket counts.
 
-`AGENT_RUN_TIMEOUT_MS = 900000` (15 min) — chosen to cover the longest legitimate codex/CLI agent run we'd see in production, even with heavy tool use. Shorter values risk a stale-marker retry firing during a healthy long run; longer values delay recovery from genuine hangs without buying any safety. This value MUST equal `HARD_TIMEOUT_MS` (see "Dispatch timeout") so that the in-process timeout and the boot recovery staleness threshold agree.
+Boot recovery is idempotent: re-running it on the same disk state produces the same scheduling fan-out. The only writes during recovery are `moveBatchToFailed` (expiry) and `recordFailure` (stale-dispatching normalize) — both atomic.
 
-This eliminates the busy-loop scenario where new retries hammered the dispatch path while a long run was still in flight.
+If `runBootRecovery` throws (e.g. disk corruption mid-readdir), `ready` stays `false` and the webhook handler returns 503 indefinitely. Operator intervenes.
 
-### Why old `deliver` closures keep doing the work
+## Debouncer adapter
 
-When we call `dispatchReplyWithBufferedBlockDispatcher`, our `deliver` callback is captured in openclaw's Promise chain. After a plugin reload (which doesn't kill the Node.js process), the closure is still alive — closures hold their own references; the Promise chain keeps them garbage-collection-rooted. When the agent finishes, the OLD `deliver` fires — calls our OLD `callReply` — does its XML-RPC post — unlinks the file. Same disk path as the new plugin instance would use, so the cleanup is correct.
-
-`ACTIVE_EMBEDDED_RUNS` is keyed by `Symbol.for("openclaw.embeddedRunState")` — a process-wide global singleton. It only dies on full Node.js process restart.
-
-### Backstop: plugin-side dispatch timeout
-
-If a dispatch hangs (CLI process stuck on a tool call, MCP server frozen, model API not returning, etc.), our `Promise.race` with `HARD_TIMEOUT_MS` fires after 15 min. We classify as `internal_error` and schedule the standard retry. The dangling dispatch promise keeps running in the background — we accept the leak; it will either eventually resolve (in which case its `deliver` may race with our retry, handled by the "re-read file before fire" check below) or never resolve and get GC'd at process exit.
-
-On openclaw 2026.5.4 there is no `stuckSessionAbortMs` config that bounds the dispatch promise — the plugin-side timeout is the **only** mechanism that rescues a wedged dispatch within a single process lifetime. Without it, a hung dispatch holds an entry hostage until next gateway restart.
-
-Because `HARD_TIMEOUT_MS == AGENT_RUN_TIMEOUT_MS`, the in-process timeout fires at the same boundary boot recovery would use to declare the marker stale. The two mechanisms reinforce each other: in-process recovery is faster (catches hangs without waiting for a restart); boot recovery is the cross-process backstop.
-
-### Subtle requirement: re-read file before firing a retry
-
-Between "schedule retry" and "backoff later, retry fires", the OLD closure (or a dangling timed-out dispatch's late `deliver`) might unlink the file. We must re-check existence at fire time, not rely on the scheduling snapshot:
+`debouncer-adapter.ts` — bridges the in-memory `createInboundDebouncer` (from openclaw plugin-sdk) to the disk-backed `processBatch`.
 
 ```ts
-function fireRetry(entryId) {
-  const current = await readQueueEntry(entryId);
-  if (!current) return;       // already handled — no-op
-  // ... proceed
-}
+onFlush = async (items: InboundMessage[]) => {
+  const last = items[items.length - 1];
+  const batch = await findOpenBatchForRecord(paths, last.model, last.res_id);
+  if (!batch) {
+    logger.info("[odoo] debouncer.onFlush: no open batch ... likely already dispatched");
+    return;
+  }
+  await processBatch(batch);
+};
 ```
 
-Cheap, closes the race.
+The webhook handler has already persisted every message to disk via `queue.appendOrCreateBatch`, so the in-memory debouncer items are effectively a flush trigger; the *content* of the batch is always read from disk. If no open batch exists (state transitioned, batch was unlinked, etc.), the adapter logs and skips — the scheduler retry path picks it up if needed.
 
-### End-to-end guarantee
+## Migration
 
-Regardless of how many plugin reloads happen during an in-flight agent run, exactly one agent run processes the message, and the file is unlinked by whichever closure finishes the delivery.
+`normalizeLegacyBatch` in `store.ts` — reshapes legacy on-disk JSON (written with `dispatchedAt: Timestamp | null`) into the current shape (with `closedAt: Timestamp | null` + `inFlightSince: Timestamp | null`).
 
-## Dispatch timeout
+Idempotent — gated by `"closedAt" in b && b.closedAt !== undefined`. Applied at every parse site: `readBatchFromFile`, `listBatchesInDir`, `findOpenBatchForRecord`, and the read inside `moveBatchToFailed`.
 
-`dispatchReplyWithBufferedBlockDispatcher` is wrapped in `Promise.race([dispatch, sleep(HARD_TIMEOUT_MS)])`. If the timeout wins, we treat it as an `internal_error` outcome (the same path a thrown promise takes), clear `dispatchedAt`, and schedule a retry. The losing dispatch promise dangles in the background — accepted.
+Disambiguation for legacy `state === "received"` with `dispatchedAt !== null`:
+- `lastAttemptAt !== null && lastAttemptAt >= dispatchedAt` → a failure was recorded after dispatch started → not in flight at crash → keep `state: "received"`, set `inFlightSince: null`, `closedAt = dispatchedAt`.
+- Otherwise → crashed mid-dispatch → flip to `state: "dispatching"`, `inFlightSince = dispatchedAt`, `closedAt = dispatchedAt`.
 
-```ts
-const timeout = new Promise<{ kind: "timeout" }>((resolve) =>
-  setTimeout(() => resolve({ kind: "timeout" }), HARD_TIMEOUT_MS).unref(),
-);
-const result = await Promise.race([
-  dispatchReplyWithBufferedBlockDispatcher({...}).then((r) => ({ kind: "ok" as const, result: r })),
-  timeout,
-]);
-if (result.kind === "timeout") {
-  // Treat as internal_error. Our `deliver` may still fire later against the
-  // file; the "re-read before fire" check in the scheduler closes the race.
-}
-```
+Reply_ready legacy batches always normalize to `inFlightSince: null` (in-flight is impossible by definition for that state).
 
-`HARD_TIMEOUT_MS = AGENT_RUN_TIMEOUT_MS = 900000` (15 min) by default. The two are conceptually the same number — "how long is reasonable for an in-flight dispatch before we consider it dead" — and MUST stay equal so the in-process timeout and the boot recovery staleness threshold agree.
+The next `writeBatch` after a normalized read drops the legacy `dispatchedAt` key naturally.
 
-### Configuration override
+## Configuration
 
-The timeout is a single top-level plugin-config knob (not per-route):
+All defined in `src/inbox/types.ts`:
 
-```yaml
-channels:
-  odoo:
-    accounts:
-      default:
-        dispatchTimeoutMs: 900000   # optional, default 15 min
-```
+| Constant | Default | Purpose |
+|---|---|---|
+| `REPLAY_TTL_MS` | 1 h | Batches in `state !== "reply_ready"` older than this expire to `failed/` at boot. |
+| `HARD_TIMEOUT_MS` | 15 min | Plugin-side hard timeout on `dispatchReplyWithBufferedBlockDispatcher`. Equals `AGENT_RUN_TIMEOUT_MS`. |
+| `AGENT_RUN_TIMEOUT_MS` | 15 min | Boot-recovery staleness boundary for `dispatching` batches. Equals `HARD_TIMEOUT_MS`. |
+| `REPLAY_STAGGER_MS` | 200 ms | Inter-batch cadence for staggered immediately-eligible received batches at boot. |
+| `DISPATCH_MAX_ATTEMPTS` | 3 | Cap on `dispatchAttempts` (silent + internal_error). |
+| `DELIVERY_MAX_ATTEMPTS` | 5 | Cap on `deliveryAttempts` (xmlrpc_failure). |
+| `DISPATCH_BACKOFF_MS` | `[30s, 120s]` | Per-attempt backoff for silent + internal_error. |
+| `DELIVERY_BACKOFF_MS` | `[5s, 25s, 120s, 600s]` | Per-attempt backoff for xmlrpc_failure (matches openclaw outbound queue). |
 
-When overridden, the same value applies to both `HARD_TIMEOUT_MS` and `AGENT_RUN_TIMEOUT_MS` — they cannot drift apart.
+Other plugin constants in `index.ts`:
 
-### Why no openclaw-side timeout to rely on
+| Constant | Default | Purpose |
+|---|---|---|
+| `INBOUND_DEBOUNCE_MS` | 3 s | Debouncer flush quiescence window. |
+| `DEDUPE_TTL_MS` | 2 min | In-memory dedup cache TTL. |
+| `DEDUPE_MAX_SIZE` | 10 000 | In-memory dedup cache capacity. |
 
-Spec previously recommended `diagnostics.stuckSessionAbortMs: 180000`. **That config does not exist on openclaw 2026.5.4** — only `stuckSessionWarnMs` (diagnostic warning, doesn't abort). It's added in 2026.5.9+. While we're targeting 2026.5.4, the plugin-side timeout is mandatory; we cannot delegate. When/if we adopt openclaw 5.9+, the plugin timeout can be a defense-in-depth backstop and openclaw can be set to a shorter abort window.
+The hard timeout / staleness boundary is the only value that's intended to be configurable; the rest are hardcoded. (Plumbing for a `dispatchTimeoutMs` config knob is not currently wired through to the type and recovery constants.)
 
-## Recovery (boot)
+## Fault model
 
-On `registerFull`, before accepting new webhooks:
-1. List `{stateDir}/odoo-inbound-queue/*.json`
-2. **Expire stale `received` entries**: if `state === "received"` AND `now - enqueuedAt > REPLAY_TTL_MS` (1 hour), move the entry straight to `failed/` and post the fallback chatter message. Reasoning: if a user wrote to a record's chatter an hour ago and we never even dispatched it, replying now is confusing — they've moved on. Better to escalate ("we missed your message, please retry") than to surprise them with a late agent response.
+- **Atomic writes are page-cache-atomic, not power-loss-durable.** Survives any process-level crash (SIGKILL, OOM, deploy restart). Does NOT survive a kernel panic or hard reboot within the OS's writeback window (~5-30s).
+- **Wall-clock timestamps** (`Date.now()`). Boot recovery compares against fresh `Date.now()`. NTP backwards-slews cause over-deferral (benign). Large forward jumps could flip a fresh `inFlightSince` to "stale" prematurely; in practice NTP jitter is sub-second.
+- **Single-gateway / single-PID.** The per-record lock is in-process. Multi-process / HA deployment requires separate inter-process locking and is out of scope.
 
-   **`reply_ready` entries are NEVER expired.** The agent's text is already produced — sunk cost. A late real reply (even days later) is strictly better than discarding the work and posting a "we couldn't process" fallback, which would be factually wrong (we *did* process; we just couldn't deliver). The only path to `failed/` for a `reply_ready` entry is exhausting the delivery cap (5 XML-RPC failures).
-3. **Check `dispatchedAt` — only for `received` entries** (see "Plugin-reload safety"):
-   - State is `received` AND `dispatchedAt` is fresh (`now - dispatchedAt < AGENT_RUN_TIMEOUT_MS`) → previous dispatch presumed still in flight → schedule a re-check at `dispatchedAt + AGENT_RUN_TIMEOUT_MS`, do NOT retry
-   - State is `received` AND `dispatchedAt` is null or stale → eligible for retry, continue to step 4
-   - State is `reply_ready` → **ignore `dispatchedAt` entirely**. The agent already produced `reply.text` before any crash window inside `deliver`, so the deferral logic doesn't help; we want immediate XML-RPC redelivery. Continue to step 4.
-4. For each remaining entry, check `lastAttemptAt + backoff(attempts) vs now`:
-   - **Immediately eligible** (never attempted, or backoff has passed) → schedule via stagger (see below)
-   - **Not yet eligible** → in-memory `setTimeout` for the exact `nextEligibleAt`
-5. **Stagger immediately-eligible `received` entries** at `REPLAY_STAGGER_MS` cadence (200ms):
-   ```
-   t=0ms     → debouncer.enqueue(entry 1)
-   t=200ms   → debouncer.enqueue(entry 2)
-   t=400ms   → debouncer.enqueue(entry 3)
-   ...
-   ```
-   Reason: firing all eligible entries simultaneously would saturate openclaw's agent concurrency lane (default 4) instantly, pushing any new webhook arriving in the first ~30s to the back of the queue. Spreading enqueue over a short window lets incoming webhooks slot in fairly between replay entries.
-   
-   `reply_ready` entries are **not** staggered — they call XML-RPC directly, don't compete for agent slots, and faster delivery is strictly better.
-6. **Log a boot summary** once recovery has fanned out:
-   ```
-   [odoo] replay: 10 eligible (8 received + 2 reply_ready), 3 scheduled, 2 deferred (dispatchedAt fresh), 5 expired → failed/
-   ```
-   Cheap to produce, makes post-incident analysis 10× faster.
+## Known limitations
 
-After boot recovery completes, retry timing is driven exclusively by in-memory `setTimeout`. Each failed attempt schedules its next try based on backoff. If the gateway crashes between attempts, the next boot's recovery scan picks the entry up again — no separate background sweeper needed.
+These are documented; some may be addressed in follow-up work.
 
-Tunables:
-- `REPLAY_TTL_MS = 60 * 60 * 1000` (1 hour, hardcoded) — applies **only to `received` entries**. `reply_ready` entries never expire by TTL (see Recovery step 2).
-- `REPLAY_STAGGER_MS = 200` (hardcoded) — small enough that 10 entries finish staggering in under 2s
-- `AGENT_RUN_TIMEOUT_MS = HARD_TIMEOUT_MS = 15 * 60 * 1000` (15 min, **overridable via `dispatchTimeoutMs` top-level account config**) — after this, a `dispatchedAt` marker is considered stale AND the in-process dispatch promise is forced to resolve via `Promise.race`. Sized to cover the longest legitimate codex/CLI agent run; shorter values risk killing a healthy long run, longer values delay recovery from genuine hangs.
+- **Hard-timeout late-deliver double-post.** If the agent hangs past `HARD_TIMEOUT_MS` AND the original dispatch promise eventually invokes its `deliver` AFTER the retry's `markDispatching` succeeded, both attempts can call `postViaCallReply` — up to 2 XML-RPC posts to the same Odoo record. The CAS prevents double agent runs but `transitionToReplyReady` has no per-attempt identity check. Bounded by `DISPATCH_MAX_ATTEMPTS`. Idempotency-key plumbing (server-side dedup keyed on `requestMessageId`) would close this end-to-end.
+- **Deferred fresh-`dispatching` batch can get stuck.** When the staleness-boundary timer fires for a batch in `state: "dispatching"`, `processBatch` hits the defensive `case "dispatching"` branch and returns without action. The batch sits in `dispatching` state until TTL expires (1 h). Easy follow-up: have that branch call `scheduler.handleFailure(ref, "internal_error", ...)` to normalize, same as recovery's stale path does at boot.
+- **Per-record (not per-batch) duplicates.** A new webhook arriving while the existing batch is in `dispatching` or `reply_ready` creates a parallel batch for the same `(model, res_id)`. Two agent runs and two XML-RPC posts on the same Odoo thread can result. The per-batchKey invariant ("processBatch is the sole batch handler") holds; the per-record invariant ("at most one agent run in flight per record") does not. Closing this requires widening `findOpenBatchForRecord` to recognize non-received batches and queue the new message somehow.
+- **`reply_ready` ignores backoff on restart.** Boot recovery fires `scheduleAt(batch, 0)` for any `reply_ready` regardless of `lastAttemptAt`. A permanently broken Odoo endpoint with frequent gateway restarts can produce self-spamming until `deliveryAttempts` cap is hit.
+- **`reply_ready` never expires by TTL.** The TTL gate is `state !== "reply_ready"`. A permanently un-deliverable reply sits on disk until `deliveryAttempts` cap is hit through live retries.
+- **Counters not bumped on raw process crash mid-`callReply`.** The `deliveryAttempts++` happens in the JS catch. A SIGKILL during `await callReply` bypasses the catch. Combined with the prior two items: pathological gateway flapping during `callReply` is unbounded.
+- **Recovery's stale-dispatching normalize bypasses the dispatch cap.** A batch entering recovery with `dispatchAttempts = MAX - 1` gets bumped to MAX by `recordFailure` and then *scheduled* (recovery doesn't check the cap after normalize). The next live failure does enforce the cap, so the effective cap is `MAX + 1` in this path.
+- **Corrupt batch file → silent split.** `findOpenBatchForRecord` swallows per-file parse errors. If the currently-open batch for a record is corrupt, the next webhook creates a fresh batch. Two open batches end up on disk for the same record. Boot recovery surfaces corruption via `summary.corrupt`, but doesn't quarantine or alert beyond a log line.
+- **`.tmp` orphans never cleaned.** Crashes during `writeJsonFileAtomically` can leave `*.json.tmp.*` files. `listBatches` filters them out, so they don't break recovery, but they accumulate forever.
+- **No fallback chatter post on cap exhaustion.** When a batch lands in `failed/`, the user sees nothing. The scheduler logs the abandonment but doesn't post a "couldn't process" notice. Intentionally scoped to "per-channel concern outside this module" — not currently handled anywhere.
+- **No graceful-shutdown hook.** The openclaw plugin SDK doesn't expose a `stop` lifecycle event. Scheduler timers are `.unref()`'d so they don't block process exit.
 
-## Dedup interaction
+## Test coverage
 
-Drop or keep the in-memory `dedupeCache`? **Keep** for hot-path speed, but the file's existence becomes the authoritative dedup key:
+`tests/` covers the inbox modules at unit granularity. Counts as of latest:
 
-- Webhook receives `message_id` X → if `<X>.json` exists in **either** `{queueDir}` (active) **or** `{queueDir}/failed/` (already abandoned) → respond 202 immediately, do NOT enqueue.
-- Cache miss + no file in either location → proceed to write + enqueue.
+| File | Tests | Focus |
+|---|---|---|
+| `record-lock.test.ts` | 5 | FIFO ordering, draining, parallel keys, error isolation |
+| `store.test.ts` | 25 | File CRUD, atomic writes, listBatches, find* lookups, migration normalizer |
+| `queue.test.ts` | 33 | Facade methods, dedup, CAS rejection, recordFailure state-flip, full lifecycle |
+| `scheduler.test.ts` | 20 | Backoff progression, cap enforcement, timer cancel/replace, re-read-before-fire |
+| `recovery.test.ts` | 17 | All six partition buckets, stale-dispatching normalize, legacy-shape integration |
+| `dispatch.test.ts` | 6 | reply_ready branch, CAS loser path, defensive dispatching skip, no-route handling |
+| `webhook-handler.test.ts` | 6 | Persist-before-ACK outcomes, ready-gate, in-memory dedup short-circuit |
+| `debouncer-adapter.test.ts` | 3 | Open batch lookup, no-batch-found skip, multi-item buffer |
 
-Including `failed/` in the dedup check matters: Odoo retries a webhook on timeout, and that retry can land minutes-to-hours after we've already moved an entry to `failed/` and posted the fallback chatter. Without this rule, the retry would create a fresh `received` entry for an already-dead message — we'd run the agent again and post a real reply layered on top of the "we couldn't process" fallback, confusing the user.
+Run: `npx tsx --test tests/*.test.ts` (also `npx tsc --noEmit` for type-check).
 
-## Idempotency key (preparation for exactly-once delivery)
-
-The at-least-once non-goal is bounded by one specific failure: a retry of a `reply_ready` entry where the previous XML-RPC call's response got lost in flight (network reset, gateway crash between Odoo's commit and our unlink). The user sees the same reply posted twice.
-
-Closing this requires server-side dedup: Odoo must recognize a retry of an already-posted reply and no-op. We can do that with a deterministic key passed alongside each post. **This spec plumbs the key plugin-side now but does not transmit it by default.** Activating it later is a server change + a route-config tweak — no plugin code change needed.
-
-### Phase 1 (this spec) — plumbing only
-
-- Every inbox entry gets an `idempotencyKey: string` field, written at file creation. Value = `String(message_id)` — already globally unique on Odoo's `mail.message` table.
-- `callReply`'s internal `argMap` exposes `idempotencyKey` as a referenceable variable (alongside `body`, `requestMessageId`, `model`, `resId`).
-- Default route configs do **not** include the kwarg, so XML-RPC posts go out unchanged. Nothing changes for Odoo today.
-
-### Phase 2 (later) — server-side activation
-
-- Add an optional `idempotency_key` kwarg to `openclaw_post_reply` in the Odoo addon. Server checks for a prior `mail.message` on `(model, res_id)` carrying this key in a custom field; if present → success no-op.
-- Update the route config in `openclaw.json` to opt in:
-  ```yaml
-  channels:
-    odoo:
-      routes:
-        - model: crm.lead
-          reply:
-            method: openclaw_post_reply
-            kwargs:
-              idempotency_key: { kind: ref, name: idempotencyKey }
-  ```
-- Deploy Odoo + flip config. Plugin code unchanged.
-
-After Phase 2 ships, the ambiguous-response duplicate case is closed: any retry of a `reply_ready` entry posts with the same key, server dedups, our `deliver` callback sees success, file unlinks. Exactly-once at near-zero runtime cost.
-
-## Failed-bucket fallback
-
-When a file moves to `failed/`:
-1. Move file (use `moveJsonDurableQueueEntryToFailed`)
-2. Best-effort post a chatter message to the record: *"⚠️ The agent couldn't process this message after several attempts. Please try again later or notify an admin."*
-3. Log a `[odoo] inbound abandoned` line with `message_id`, `lastFailureClass`, `lastError`
-4. (Optional, future) Emit a diagnostic event for alerting
-
-## Graceful-shutdown hook (optional, low priority)
-
-In the `stop` callback inside `runStoppablePassiveMonitor`:
-1. Iterate in-memory active dispatches; for each, write a `"interrupted_at": <now>` marker on its file
-2. On boot, these files get prioritized for immediate replay (skip backoff)
-
-Skip this in v1 if it adds complexity — janitor scan handles it anyway, just slower.
-
-## Out of scope for v1
-
-- Cross-instance coordination (assumes single gateway process owns the queue dir — true today, would need locking if we go HA)
-- Compaction / archival of `failed/` (manual ops for now)
-- Metrics endpoint (`/odoo/queue/stats`) — useful but additive
-- Configurable backoff via plugin config — hardcode initially
-
-## Tests to write
-
-- Webhook write fails (disk full) → must return 503, not 202
-- Two webhooks with same message_id → second one detected as dup
-- Process killed mid-dispatch → file in `received`, replayed on boot
-- Process killed mid-XML-RPC → file in `reply_ready`, redelivered on boot
-- Agent always silent → 3 attempts → moved to `failed/` + fallback post
-- XML-RPC errors transient → succeeds on retry, file unlinked
-- 1000 entries in queue dir at boot → expired `received` entries (>1h old) skip replay and go to `failed/` with fallback post; only recent ones replay; recovery does not block webhook handler
-- `received` entry with `enqueuedAt` 65 min ago → moved to `failed/` on boot, fallback chatter post fires
-- `reply_ready` entry with `enqueuedAt` 25 hours ago → NOT moved to failed; recovery attempts XML-RPC delivery normally (never expires by TTL)
-
-## Resolved questions
-
-- **What does `failedCounts` mean?** Per-kind (`tool` / `block` / `final`) count of dispatch failures from openclaw's reply dispatcher. Useful for diagnostics, NOT for our retry decision — we read XML-RPC success/failure directly from inside our `deliver` callback.
-- **Where does XML-RPC failure surface?** Our `deliver` throws → openclaw catches it → fires our `onError` callback + increments `failedCounts.final` + the promise still resolves. Authoritative signal is our own callback bookkeeping.
-
-## Still open (defer to implementation)
-
-- Should the failed-bucket fallback chatter post itself be retried if it fails? (Currently spec says best-effort, log on failure.)
-- Whether to expose backoff schedules as plugin config or keep them hardcoded.
+End-to-end smoke tests (webhook → debouncer flush → agent → callReply round-trip; crash + recovery roundtrip; hard-timeout edge) are not present — they require a substantial mock of the openclaw runtime. Deferred.

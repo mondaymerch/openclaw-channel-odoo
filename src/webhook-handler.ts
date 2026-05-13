@@ -13,6 +13,7 @@ import {
 } from "openclaw/plugin-sdk/infra-runtime";
 import { resolveOdooSection } from "./channel.js";
 import type { InboundMessage, PluginApi } from "./dispatch.js";
+import type { InboxQueue } from "./inbox/queue.js";
 
 type DedupeCache = ReturnType<typeof createDedupeCache>;
 type Debouncer = { enqueue: (item: InboundMessage) => Promise<void> };
@@ -21,8 +22,16 @@ export function createWebhookHandler(deps: {
   api: PluginApi;
   dedupe: DedupeCache;
   debouncer: Debouncer;
+  queue: InboxQueue;
+  /**
+   * Ready-gate. Returns false while boot recovery is still partitioning
+   * the on-disk state. Handler returns 503 so Odoo retries instead of
+   * dropping the message. Read per-request — the flag flips after the
+   * handler factory has already been built.
+   */
+  isReady: () => boolean;
 }): (req: IncomingMessage, res: ServerResponse) => Promise<boolean> {
-  const { api, dedupe, debouncer } = deps;
+  const { api, dedupe, debouncer, queue, isReady } = deps;
 
   return async (req, res) => {
     const respond = (status: number, payload: object) => {
@@ -78,6 +87,13 @@ export function createWebhookHandler(deps: {
       });
     }
 
+    // Refuse new traffic while boot recovery is still partitioning disk
+    // state. Recovery flips this true once it has scheduled every stale
+    // batch. Odoo retries 5xx, so no message is dropped during the window.
+    if (!isReady()) {
+      return respond(503, { error: "Plugin starting — please retry" });
+    }
+
     // Dedup: drop webhook retries from Odoo's own controller retry logic.
     // Operator-initiated Retry (minutes later) will bypass this and
     // re-dispatch.
@@ -88,10 +104,41 @@ export function createWebhookHandler(deps: {
       return respond(202, { accepted: true, duplicate: true });
     }
 
+    // Persist BEFORE we ACK. The 202 we hand back to Odoo must mean
+    // "this message is durably enqueued"; a disk failure here returns
+    // 503 so Odoo retries instead of dropping the message silently.
+    const result = await queue.appendOrCreateBatch({
+      model,
+      res_id,
+      message_id,
+      body,
+      user_name,
+      partner_id,
+    });
+
+    if (!result.ok) {
+      if (result.reason === "duplicate") {
+        // Disk-level dedup — message_id is already in some on-disk
+        // batch (active or failed). Memory cache missed (TTL expired or
+        // process restarted) but disk is authoritative.
+        api.logger.info(
+          `[odoo] Disk-duplicate message_id ${message_id} on ${model},${res_id} ` +
+            `(existing batch ${result.existingBatchKey}) — skipping`,
+        );
+        return respond(202, { accepted: true, duplicate: true });
+      }
+      api.logger.error(
+        `[odoo] queue.appendOrCreateBatch disk_error for ${model},${res_id} ` +
+          `message_id=${message_id}: ${formatErr(result.error)}`,
+      );
+      return respond(503, { error: "Persist failure — please retry" });
+    }
+
     api.logger.info(
-      `[odoo] Inbound from ${user_name ?? "unknown"} on ${model},${res_id}`,
+      `[odoo] Inbound from ${user_name ?? "unknown"} on ${model},${res_id} ` +
+        `batchKey=${result.batchKey} didCreate=${result.didCreate}`,
     );
-    respond(202, { accepted: true, message_id });
+    respond(202, { accepted: true, message_id, batchKey: result.batchKey });
 
     // Debouncer batches rapid messages to the same record; onFlush
     // dispatches to the agent. Fire-and-forget — errors land in onError.
@@ -106,4 +153,14 @@ export function createWebhookHandler(deps: {
 
     return true;
   };
+}
+
+function formatErr(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
 }

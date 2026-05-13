@@ -1,7 +1,13 @@
 /**
- * dispatchBatch — the 5-step route → ctx → session → dispatch → deliver
- * pipeline that hands a batch of inbound Odoo messages to the agent and
- * posts the reply back via XML-RPC.
+ * Dispatch handler — the route → ctx → session → dispatch → deliver
+ * pipeline that hands a persisted batch of inbound Odoo messages to the
+ * agent and posts the reply back via XML-RPC.
+ *
+ * Exposed via `createDispatchHandler(...)`'s `processBatch` method, which
+ * is the SINGLE entry point for batch handling in this plugin. Called by:
+ *   - the debouncer's onFlush adapter (after first webhook in a batch)
+ *   - the scheduler's retry timer (after a classified failure)
+ *   - boot recovery (indirectly, via scheduler.scheduleAt)
  */
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
@@ -14,9 +20,13 @@ import {
 import {
   findRouteForModel,
   getClient,
+  type CompiledRoute,
   type ResolvedOdooAccount,
 } from "./channel.js";
-import type { OdooConfig } from "./client.js";
+import type { CallReplyParams, OdooConfig } from "./client.js";
+import type { BatchRef, InboxQueue } from "./inbox/queue.js";
+import type { RetryScheduler } from "./inbox/scheduler.js";
+import { HARD_TIMEOUT_MS, type InboxBatch } from "./inbox/types.js";
 import { getOdooRuntime } from "./runtime.js";
 
 export const CHANNEL_ID = "odoo";
@@ -70,153 +80,297 @@ function formatChannelHeader(params: {
   return parts.join(" ");
 }
 
-export function createDispatchBatch(deps: {
+export type DispatchHandler = {
+  /**
+   * Process a single batch. The ONLY batch-handler in the system.
+   *
+   * Branches on `batch.state`:
+   *  - "received"     → full dispatch (agent run + deliver wrap)
+   *  - "reply_ready"  → skip the agent, re-fire XML-RPC with the saved text
+   *
+   * Does not throw to the caller for classified failures (silent /
+   * internal_error / xmlrpc_failure) — those are reported via
+   * `scheduler.handleFailure`.
+   */
+  processBatch(batch: InboxBatch): Promise<void>;
+};
+
+export type CreateDispatchHandlerDeps = {
   api: PluginApi;
   account: ResolvedOdooAccount;
   clientConfig: OdooConfig;
-}): (items: InboundMessage[]) => Promise<void> {
-  const { api, account, clientConfig } = deps;
+  queue: InboxQueue;
+  scheduler: RetryScheduler;
+  /** Hard timeout for the dispatch await. Default: `HARD_TIMEOUT_MS` (15min). */
+  hardTimeoutMs?: number;
+  /**
+   * Test seam — default uses `channel.ts`'s real `getClient`. Tests inject
+   * a fake to avoid spinning up an XML-RPC client.
+   */
+  getClient?: (cfg: OdooConfig) => { callReply: (p: CallReplyParams) => Promise<unknown> };
+};
 
-  return async (items) => {
-    if (items.length === 0) return;
-    const last = items[items.length - 1];
-    const { model, res_id } = last;
-    const peerId = `${model}:${res_id}`;
-    const combinedBody = items.map((i) => i.body).join("\n\n");
-    const messageIds = items.map((i) => String(i.message_id));
+export function createDispatchHandler(deps: CreateDispatchHandlerDeps): DispatchHandler {
+  const { api, account, clientConfig, queue, scheduler } = deps;
+  const hardTimeoutMs = deps.hardTimeoutMs ?? HARD_TIMEOUT_MS;
+  const getOdooClient = deps.getClient ?? getClient;
 
-    try {
-      const rt = getOdooRuntime();
-      const cfg = api.config;
+  return {
+    async processBatch(batch: InboxBatch): Promise<void> {
+      const ref: BatchRef = {
+        model: batch.model,
+        res_id: batch.res_id,
+        batchKey: batch.batchKey,
+      };
 
-      const matched = findRouteForModel(account.routes, model);
+      let matched: CompiledRoute;
+      try {
+        matched = findRouteForModel(account.routes, batch.model);
+      } catch (err) {
+        // findRouteForModel throws when no route matches AND no catchall
+        // exists. `compileRoutes` adds a catchall at the end, so in
+        // production this can't fire — but defensive against misconfig.
+        api.logger.error(
+          `[odoo] processBatch: no route for model=${batch.model} batchKey=${batch.batchKey}`,
+        );
+        await scheduler.handleFailure(ref, "internal_error", err);
+        return;
+      }
 
-      let route = rt.channel.routing.resolveAgentRoute({
-        cfg,
-        channel: CHANNEL_ID,
-        accountId: ACCOUNT_ID,
-        peer: { kind: "direct", id: peerId },
-      });
+      // ---- Branch on batch.state --------------------------------------
+      switch (batch.state) {
+        case "reply_ready": {
+          // Branch 1: agent already produced the text on a prior attempt;
+          // just re-fire XML-RPC. Don't re-run the agent.
+          if (!batch.reply) {
+            api.logger.error(
+              `[odoo] reply_ready batch without reply.text batchKey=${batch.batchKey}`,
+            );
+            await scheduler.handleFailure(
+              ref,
+              "internal_error",
+              new Error("reply_ready without reply.text"),
+            );
+            return;
+          }
+          try {
+            await postViaCallReply(getOdooClient, matched, account, clientConfig, batch, batch.reply.text);
+            await queue.recordDeliverySuccess(ref);
+          } catch (err) {
+            await scheduler.handleFailure(ref, "xmlrpc_failure", err);
+          }
+          return;
+        }
+        case "dispatching": {
+          // Shouldn't reach here — scheduler and boot recovery never
+          // schedule a "dispatching" batch directly (recovery normalizes
+          // stale dispatching to "received" first; live dispatching means
+          // some other caller is already mid-flight). Defensive skip.
+          api.logger.error(
+            `[odoo] processBatch unexpected state=dispatching batchKey=${batch.batchKey} — skipping`,
+          );
+          return;
+        }
+        case "received":
+          break; // fall through to Branch 2 below
+        default: {
+          const _exhaustive: never = batch.state;
+          api.logger.error(
+            `[odoo] processBatch unknown state batchKey=${batch.batchKey}: ${String(_exhaustive)}`,
+          );
+          return;
+        }
+      }
 
-      // Per-route agentId override — mirrors the Telegram topic-agent pattern
-      // (see telegram bot-Ch7__EHu.js:663-689). We rebuild the sessionKey from
-      // the override agent so downstream session records are scoped correctly.
-      if (matched.agentId) {
-        const agentId = sanitizeAgentId(matched.agentId);
-        const sessionKey = buildAgentSessionKey({
-          agentId,
+      // ---- Branch 2: received — full dispatch -------------------------
+      // CAS transition received → dispatching. If we lose (another caller
+      // is already dispatching this batchKey, or the file vanished), skip.
+      const markResult = await queue.markDispatching(ref);
+      if (!markResult.ok) {
+        api.logger.info(
+          `[odoo] processBatch skipping dispatch batchKey=${batch.batchKey} reason=${markResult.reason}`,
+        );
+        return;
+      }
+      // Tracks what the deliver wrapper observed. null = deliver never
+      // fired successfully (silent agent, or post-await we'll classify).
+      let deliverOutcome: "success" | "xmlrpc_failure" | null = null;
+
+      try {
+        const rt = getOdooRuntime();
+        const cfg = api.config;
+        const last = batch.messages[batch.messages.length - 1];
+        const peerId = `${batch.model}:${batch.res_id}`;
+        const combinedBody = batch.messages.map((m) => m.body).join("\n\n");
+        const messageIds = batch.messages.map((m) => String(m.message_id));
+
+        // --- Route resolution + per-route agentId override.
+        let route = rt.channel.routing.resolveAgentRoute({
+          cfg,
           channel: CHANNEL_ID,
           accountId: ACCOUNT_ID,
           peer: { kind: "direct", id: peerId },
-          dmScope: cfg.session?.dmScope,
-          identityLinks: cfg.session?.identityLinks,
         });
-        const mainSessionKey = buildAgentMainSessionKey({ agentId });
-        route = {
-          ...route,
-          agentId,
-          sessionKey,
-          mainSessionKey,
-          lastRoutePolicy: deriveLastRoutePolicy({ sessionKey, mainSessionKey }),
-        };
+        if (matched.agentId) {
+          const agentId = sanitizeAgentId(matched.agentId);
+          const sessionKey = buildAgentSessionKey({
+            agentId,
+            channel: CHANNEL_ID,
+            accountId: ACCOUNT_ID,
+            peer: { kind: "direct", id: peerId },
+            dmScope: cfg.session?.dmScope,
+            identityLinks: cfg.session?.identityLinks,
+          });
+          const mainSessionKey = buildAgentMainSessionKey({ agentId });
+          route = {
+            ...route,
+            agentId,
+            sessionKey,
+            mainSessionKey,
+            lastRoutePolicy: deriveLastRoutePolicy({ sessionKey, mainSessionKey }),
+          };
+        }
+
+        const recordAddress = `${CHANNEL_ID}:record:${peerId}`;
+        const bodyForAgent = matched.promptHeader
+          ? `${formatChannelHeader({
+              model: batch.model,
+              resId: batch.res_id,
+              userName: last.user_name,
+              partnerId: last.partner_id,
+            })}\n\n${combinedBody}`
+          : combinedBody;
+
+        const ctx = rt.channel.reply.finalizeInboundContext({
+          Body: combinedBody,
+          BodyForAgent: bodyForAgent,
+          RawBody: combinedBody,
+          CommandBody: combinedBody,
+          From: `${CHANNEL_ID}:partner:${last.partner_id}`,
+          To: recordAddress,
+          SessionKey: route.sessionKey,
+          AccountId: ACCOUNT_ID,
+          ChatType: "direct",
+          SenderId: String(last.partner_id),
+          SenderName: last.user_name ?? "Odoo User",
+          Provider: CHANNEL_ID,
+          Surface: CHANNEL_ID,
+          MessageSid: String(last.message_id),
+          MessageSids: messageIds,
+          MessageSidFirst: messageIds[0],
+          MessageSidLast: messageIds[messageIds.length - 1],
+          ReplyToId: String(last.message_id),
+          Timestamp: Date.now(),
+          OriginatingChannel: CHANNEL_ID,
+          OriginatingTo: recordAddress,
+          CommandAuthorized: false,
+        });
+
+        const storePath = rt.channel.session.resolveStorePath(
+          cfg.session?.store,
+          { agentId: route.agentId },
+        );
+        await rt.channel.session.recordInboundSession({
+          storePath,
+          sessionKey: route.sessionKey,
+          ctx,
+          updateLastRoute: {
+            sessionKey: route.mainSessionKey,
+            channel: CHANNEL_ID,
+            to: recordAddress,
+            accountId: ACCOUNT_ID,
+          },
+          onRecordError: (err: unknown) => {
+            api.logger.error(`[odoo] Session record error: ${err}`);
+          },
+        });
+
+        // --- Race: openclaw dispatch vs hard timeout
+        const dispatchPromise = rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+          ctx,
+          cfg,
+          dispatcherOptions: {
+            deliver: async (replyPayload: { text?: string }) => {
+              const text = replyPayload?.text;
+              if (!text) return;
+              api.logger.info(
+                `[odoo] Delivering reply to ${batch.model},${batch.res_id}`,
+              );
+              await queue.transitionToReplyReady(ref, text);
+              try {
+                await postViaCallReply(getOdooClient, matched, account, clientConfig, batch, text);
+                await queue.recordDeliverySuccess(ref);
+                deliverOutcome = "success";
+              } catch (xmlErr) {
+                await scheduler.handleFailure(ref, "xmlrpc_failure", xmlErr);
+                deliverOutcome = "xmlrpc_failure";
+                // Do NOT rethrow — we've handled it. Rethrowing would just
+                // cascade to the outer catch which would re-classify as
+                // internal_error and double-bump counters.
+              }
+            },
+            onError: (err: unknown) => {
+              api.logger.error(`[odoo] Reply dispatch error: ${err}`);
+            },
+          },
+        });
+
+        const result = await Promise.race<{ kind: "resolved" } | { kind: "timeout" }>([
+          dispatchPromise.then(() => ({ kind: "resolved" as const })),
+          new Promise<{ kind: "timeout" }>((resolve) => {
+            const t = setTimeout(() => resolve({ kind: "timeout" }), hardTimeoutMs);
+            if (t && typeof (t as { unref?: () => void }).unref === "function") {
+              (t as { unref: () => void }).unref();
+            }
+          }),
+        ]);
+
+        if (result.kind === "timeout" && deliverOutcome === null) {
+          await scheduler.handleFailure(
+            ref,
+            "internal_error",
+            new Error("dispatch hard timeout"),
+          );
+          // The original dispatch promise still runs in background. Its
+          // eventual deliver (if any) hits the re-read-before-fire pattern
+          // — batch may already be unlinked or re-dispatched by then.
+        } else if (result.kind === "resolved" && deliverOutcome === null) {
+          // Dispatch resolved cleanly but no successful deliver fired →
+          // agent silent (no final reply produced).
+          await scheduler.handleFailure(
+            ref,
+            "silent",
+            new Error("dispatch resolved without successful deliver"),
+          );
+        }
+      } catch (err) {
+        if (deliverOutcome === null) {
+          await scheduler.handleFailure(ref, "internal_error", err);
+        }
       }
-
-      const recordAddress = `${CHANNEL_ID}:record:${peerId}`;
-
-      // Prepend a single-line channel/sender header to BodyForAgent only.
-      // Body / RawBody / CommandBody stay raw — they feed dedup, command
-      // stripping, and directive resolution, all of which must not see
-      // plugin-injected content.
-      const bodyForAgent = matched.promptHeader
-        ? `${formatChannelHeader({
-            model,
-            resId: res_id,
-            userName: last.user_name,
-            partnerId: last.partner_id,
-          })}\n\n${combinedBody}`
-        : combinedBody;
-
-      const ctx = rt.channel.reply.finalizeInboundContext({
-        Body: combinedBody,
-        BodyForAgent: bodyForAgent,
-        RawBody: combinedBody,
-        CommandBody: combinedBody,
-        From: `${CHANNEL_ID}:partner:${last.partner_id}`,
-        To: recordAddress,
-        SessionKey: route.sessionKey,
-        AccountId: ACCOUNT_ID,
-        ChatType: "direct",
-        SenderId: String(last.partner_id),
-        SenderName: last.user_name ?? "Odoo User",
-        Provider: CHANNEL_ID,
-        Surface: CHANNEL_ID,
-        MessageSid: String(last.message_id),
-        MessageSids: messageIds,
-        MessageSidFirst: messageIds[0],
-        MessageSidLast: messageIds[messageIds.length - 1],
-        // Carries the triggering message_id through to
-        // attachedResults.sendText (→ ctx.replyToId), which passes it as
-        // requestMessageId in the XML-RPC callback. Without this, Odoo's
-        // openclaw_post_reply receives 0, skips the tracking flip and bus
-        // notification, and the user's panel never refreshes.
-        ReplyToId: String(last.message_id),
-        Timestamp: Date.now(),
-        OriginatingChannel: CHANNEL_ID,
-        OriginatingTo: recordAddress,
-        CommandAuthorized: false,
-      });
-
-      const storePath = rt.channel.session.resolveStorePath(
-        cfg.session?.store,
-        { agentId: route.agentId },
-      );
-      await rt.channel.session.recordInboundSession({
-        storePath,
-        sessionKey: route.sessionKey,
-        ctx,
-        updateLastRoute: {
-          sessionKey: route.mainSessionKey,
-          channel: CHANNEL_ID,
-          to: recordAddress,
-          accountId: ACCOUNT_ID,
-        },
-        onRecordError: (err: unknown) => {
-          api.logger.error(`[odoo] Session record error: ${err}`);
-        },
-      });
-
-      await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-        ctx,
-        cfg,
-        dispatcherOptions: {
-          deliver: async (replyPayload: { text?: string }) => {
-            const text = replyPayload?.text;
-            if (!text) return;
-
-            api.logger.info(
-              `[odoo] Delivering reply to ${model},${res_id}`,
-            );
-
-            await getClient(clientConfig).callReply({
-              model,
-              resId: res_id,
-              body: text,
-              requestMessageId: last.message_id,
-              method: matched.reply.method,
-              argNames: matched.reply.args,
-              kwargs: matched.reply.kwargs,
-              botSessionId: account.botSessionId,
-            });
-          },
-          onError: (err: unknown) => {
-            api.logger.error(`[odoo] Reply dispatch error: ${err}`);
-          },
-        },
-      });
-    } catch (err) {
-      api.logger.error(
-        `[odoo] Failed to dispatch batch for ${peerId} (${items.length} msg): ${err}`,
-      );
-    }
+    },
   };
+}
+
+/** XML-RPC call shared by both branches. Reuses the matched route's reply
+ *  config (method + arg names + kwargs) and the account's botSessionId. */
+async function postViaCallReply(
+  getClientFn: (cfg: OdooConfig) => { callReply: (p: CallReplyParams) => Promise<unknown> },
+  matched: CompiledRoute,
+  account: ResolvedOdooAccount,
+  clientConfig: OdooConfig,
+  batch: InboxBatch,
+  text: string,
+): Promise<void> {
+  const last = batch.messages[batch.messages.length - 1];
+  await getClientFn(clientConfig).callReply({
+    model: batch.model,
+    resId: batch.res_id,
+    body: text,
+    requestMessageId: last.message_id,
+    method: matched.reply.method,
+    argNames: matched.reply.args,
+    kwargs: matched.reply.kwargs,
+    botSessionId: account.botSessionId,
+  });
 }

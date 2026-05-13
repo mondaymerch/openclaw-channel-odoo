@@ -127,6 +127,11 @@ export function createWebhookHandler(deps: {
         );
         return respond(202, { accepted: true, duplicate: true });
       }
+      // The in-memory dedup cache marked this message_id as seen during
+      // the dedupe.check() call above (createDedupeCache.check() touches
+      // the key on every call, not just hits). Roll back so Odoo's retry
+      // isn't swallowed as a duplicate — otherwise this is silent loss.
+      dedupe.delete(String(message_id));
       api.logger.error(
         `[odoo] queue.appendOrCreateBatch disk_error for ${model},${res_id} ` +
           `message_id=${message_id}: ${formatErr(result.error)}`,

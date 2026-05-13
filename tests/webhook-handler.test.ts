@@ -14,6 +14,8 @@ import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
+import { createDedupeCache } from "openclaw/plugin-sdk/infra-runtime";
+
 import { createWebhookHandler } from "../src/webhook-handler.js";
 import type { PluginApi, InboundMessage } from "../src/dispatch.js";
 import type {
@@ -49,14 +51,25 @@ function makeApi(): { api: PluginApi; infos: string[]; errors: string[] } {
   return { api: { config: makeConfig(), logger }, infos, errors };
 }
 
-type DedupeStub = { check: (key: string | undefined | null) => boolean };
-function makeDedupe(opts: { hits?: boolean } = {}): DedupeStub & { calls: string[] } {
-  const calls: string[] = [];
+type DedupeStub = {
+  check: (key: string | undefined | null) => boolean;
+  delete: (key: string | undefined | null) => void;
+};
+function makeDedupe(opts: { hits?: boolean } = {}): DedupeStub & {
+  checkCalls: string[];
+  deleteCalls: string[];
+} {
+  const checkCalls: string[] = [];
+  const deleteCalls: string[] = [];
   return {
-    calls,
+    checkCalls,
+    deleteCalls,
     check(key) {
-      calls.push(String(key));
+      checkCalls.push(String(key));
       return opts.hits === true;
+    },
+    delete(key) {
+      deleteCalls.push(String(key));
     },
   };
 }
@@ -275,6 +288,10 @@ test("E2-T4: disk_error → 503, debouncer.enqueue NOT called, error logged", as
     (m) => m.includes("disk_error") && m.includes("ENOSPC"),
   );
   assert.ok(log);
+  // Critical: the dedup mark from the earlier check() must be rolled
+  // back so Odoo's retry can re-attempt persistence (otherwise the
+  // retry hits the cache and the message is silently lost).
+  assert.deepEqual(dedupe.deleteCalls, ["1001"]);
 });
 
 // ============================================================
@@ -326,4 +343,74 @@ test("E3-T4: ready-gate closed → 503, queue.appendOrCreateBatch NOT called", a
   assert.equal(getStatus(), 503);
   assert.equal(queue.calls.length, 0);
   assert.equal(debouncer.calls.length, 0);
+});
+
+// ============================================================
+// E2-T6: disk_error followed by Odoo retry → second call persists
+// (regression test for the memory-dedup poisoning bug — uses a REAL
+// createDedupeCache because the bug is in the SDK's check() side-effect
+// semantics; a constant-return stub can't reproduce it.)
+// ============================================================
+
+test("E2-T6: disk_error rolls back dedup mark; Odoo retry persists (no silent loss)", async () => {
+  const { api } = makeApi();
+  const debouncer = makeDebouncer();
+
+  const realDedupe = createDedupeCache({ ttlMs: 60_000, maxSize: 100 });
+
+  let queueCallCount = 0;
+  const queueCalls: AppendOrCreateInput[] = [];
+  const queue = {
+    async appendOrCreateBatch(
+      input: AppendOrCreateInput,
+    ): Promise<AppendOrCreateResult> {
+      queueCalls.push(input);
+      queueCallCount += 1;
+      if (queueCallCount === 1) {
+        return {
+          ok: false,
+          reason: "disk_error",
+          error: new Error("ENOSPC: no space left"),
+        };
+      }
+      return { ok: true, batchKey: "persisted-on-retry", didCreate: true };
+    },
+    async markDispatching() { throw new Error("not used"); },
+    async transitionToReplyReady() { throw new Error("not used"); },
+    async recordDeliverySuccess() { throw new Error("not used"); },
+    async recordFailure() { throw new Error("not used"); },
+    async moveBatchToFailed() { throw new Error("not used"); },
+  } as unknown as InboxQueue;
+
+  const handler = createWebhookHandler({
+    api,
+    dedupe: realDedupe,
+    debouncer,
+    queue,
+    isReady: () => true,
+  });
+
+  // First call: disk write fails → 503.
+  const a = makeReqRes({ body: validBody({ message_id: 42 }) });
+  await handler(a.req, a.res);
+  assert.equal(a.getStatus(), 503);
+
+  // Odoo retries with the SAME message_id. Without the rollback fix,
+  // this would short-circuit on the lingering dedup mark and respond
+  // 202+duplicate without persisting (silent loss).
+  const b = makeReqRes({ body: validBody({ message_id: 42 }) });
+  await handler(b.req, b.res);
+  assert.equal(b.getStatus(), 202);
+  const body = b.getBody();
+  assert.equal(body.accepted, true);
+  // CRITICAL: must NOT be a duplicate response — the disk_error
+  // rolled back the mark so the retry proceeds to the queue.
+  assert.notEqual(body.duplicate, true);
+  assert.equal(body.batchKey, "persisted-on-retry");
+
+  // Queue actually called twice (failure + success), confirming the
+  // retry path wasn't short-circuited by the dedup cache.
+  assert.equal(queueCalls.length, 2);
+  assert.equal(debouncer.calls.length, 1);
+  assert.equal(debouncer.calls[0].message_id, 42);
 });

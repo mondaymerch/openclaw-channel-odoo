@@ -24,6 +24,18 @@ jobs:
 
       - run: npm run build
 
-      - run: npm publish --access public
+      # Route pre-releases (semver suffix with `-`, e.g. 0.4.0-beta) to the
+      # `beta` dist-tag so `npm install <pkg>` keeps installing the latest
+      # stable. Stable versions publish to the default `latest` dist-tag.
+      - name: Publish to npm
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "Publishing pre-release $VERSION to dist-tag beta"
+            npm publish --access public --tag beta
+          else
+            echo "Publishing stable $VERSION to dist-tag latest"
+            npm publish --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -20,6 +20,12 @@ jobs:
 
       - run: npm ci
 
+      # tsx is the runner for our node:test suite. It's not in our
+      # devDependencies (would force a lockfile regen, which Mac can't do
+      # cleanly due to openclaw's optional Discord native-binding deps).
+      # Installing it --no-save here keeps the lockfile pristine.
+      - run: npm install --no-save tsx@^4.21.0
+
       - run: npm run lint
 
       - run: npm test

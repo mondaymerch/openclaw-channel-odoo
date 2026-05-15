@@ -17,7 +17,8 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts"
   },
   "openclaw": {
     "extensions": [
@@ -56,6 +57,7 @@
   },
   "devDependencies": {
     "openclaw": ">=2026.4.15",
+    "tsx": "^4.21.0",
     "typescript": "^5.4.0"
   }
 }

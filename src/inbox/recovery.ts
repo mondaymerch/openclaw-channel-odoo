@@ -44,6 +44,10 @@ export type RunBootRecoveryDeps = {
   logger: { info: (msg: string) => void; error: (msg: string) => void };
   /** Test seam — default `Date.now`. */
   now?: () => Timestamp;
+  /** Staleness boundary for `dispatching` batches. Must equal the dispatcher's
+   *  `hardTimeoutMs` — they share semantic meaning ("after this long, the
+   *  in-flight attempt is presumed dead"). Defaults to `AGENT_RUN_TIMEOUT_MS`. */
+  agentTimeoutMs?: number;
 };
 
 export async function runBootRecovery(
@@ -51,6 +55,7 @@ export async function runBootRecovery(
 ): Promise<BootRecoverySummary> {
   const { paths, queue, scheduler, logger } = deps;
   const now = deps.now ?? (() => Date.now());
+  const agentTimeoutMs = deps.agentTimeoutMs ?? AGENT_RUN_TIMEOUT_MS;
 
   const summary: BootRecoverySummary = {
     total: 0,
@@ -123,9 +128,9 @@ export async function runBootRecovery(
     if (batch.state === "dispatching") {
       if (
         batch.inFlightSince !== null &&
-        tNow - batch.inFlightSince < AGENT_RUN_TIMEOUT_MS
+        tNow - batch.inFlightSince < agentTimeoutMs
       ) {
-        const delay = batch.inFlightSince + AGENT_RUN_TIMEOUT_MS - tNow;
+        const delay = batch.inFlightSince + agentTimeoutMs - tNow;
         scheduler.scheduleAt(batch, delay);
         summary.deferred += 1;
         continue;

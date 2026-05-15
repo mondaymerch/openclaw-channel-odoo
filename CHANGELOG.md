@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (pre-1.0: minor bumps may contain breaking changes).
 
+## [Unreleased]
+
+### Added
+
+- **`channels.odoo.debounceMs` and `channels.odoo.agentTimeoutMs` are now config-tunable.** Both optional with current defaults preserved (3000 ms and 900_000 ms / 15 min respectively). Operators can tighten the debounce for low-volume records or extend the agent timeout for heavier reasoning without forking the plugin.
+  - `debounceMs` accepts integers in `[0, 60000]`.
+  - `agentTimeoutMs` accepts integers in `[30000, REPLAY_TTL_MS]` (i.e. ≤ 1 h). Values above that would let the on-disk TTL fire before the in-process timeout, leaving the batch in `dispatching` until the next boot's recovery sweep — rejected at startup with a clear error.
+
 ## [0.4.0] — 2026-05-15
 
 Promotes [0.4.0-beta](#040-beta--2026-05-13) to the stable `latest` dist-tag. `npm install openclaw-channel-odoo` now resolves to 0.4.0; existing 0.3.1 installs are unaffected until they upgrade.

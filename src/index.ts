@@ -32,9 +32,6 @@ import {
 } from "./inbox/store.js";
 import { createWebhookHandler } from "./webhook-handler.js";
 
-// Batch rapid messages to the same record into one agent run.
-const INBOUND_DEBOUNCE_MS = 3000;
-
 // Covers Odoo's ~10s webhook retry window (RETRY_DELAYS [0.5, 1] +
 // GATEWAY_TIMEOUT 3) with margin. Short enough that an operator Retry
 // minutes later bypasses dedup and re-dispatches.
@@ -99,6 +96,7 @@ const entry: any = defineChannelPluginEntry({
       clientConfig,
       queue: inboxQueue,
       scheduler,
+      hardTimeoutMs: account.agentTimeoutMs,
     });
 
     const onFlush = createDebouncerAdapter({
@@ -108,7 +106,7 @@ const entry: any = defineChannelPluginEntry({
     });
 
     const debouncer = createInboundDebouncer<InboundMessage>({
-      debounceMs: INBOUND_DEBOUNCE_MS,
+      debounceMs: account.debounceMs,
       buildKey: (item) => `${item.model}:${item.res_id}`,
       onFlush,
       onError: (err, items) => {
@@ -142,6 +140,7 @@ const entry: any = defineChannelPluginEntry({
           queue: inboxQueue,
           scheduler,
           logger: api.logger,
+          agentTimeoutMs: account.agentTimeoutMs,
         });
         api.logger.info(
           `[odoo] inbox.recovery complete — total=${summary.total} ` +

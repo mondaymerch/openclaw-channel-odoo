@@ -15,6 +15,11 @@ import {
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import { runStoppablePassiveMonitor } from "openclaw/plugin-sdk/extension-shared";
 import { OdooClient, type OdooConfig } from "./client.js";
+import {
+  HARD_TIMEOUT_MS,
+  INBOUND_DEBOUNCE_MS,
+  REPLAY_TTL_MS,
+} from "./inbox/types.js";
 
 export const CHANNEL_ID = "odoo";
 
@@ -60,6 +65,12 @@ export interface ResolvedOdooAccount {
   allowFrom: string[];
   botSessionId: string | null;
   routes: CompiledRoute[];
+  /** Inbound debounce window in ms. Defaults to INBOUND_DEBOUNCE_MS (3000). */
+  debounceMs: number;
+  /** Hard timeout for one dispatch attempt (agent run + delivery) in ms.
+   *  Also the staleness boundary for `dispatching` batches in boot recovery.
+   *  Defaults to HARD_TIMEOUT_MS (900_000 = 15min). Capped at REPLAY_TTL_MS. */
+  agentTimeoutMs: number;
 }
 
 // Per-account client cache
@@ -261,6 +272,22 @@ export function resolveAccount(
 
   const routes = compileRoutes(section.routes);
 
+  const debounceMs = readBoundedInt(section.debounceMs, {
+    field: "debounceMs",
+    default: INBOUND_DEBOUNCE_MS,
+    min: 0,
+    max: 60_000,
+  });
+  const agentTimeoutMs = readBoundedInt(section.agentTimeoutMs, {
+    field: "agentTimeoutMs",
+    default: HARD_TIMEOUT_MS,
+    // <30s would kill almost any real agent run. >REPLAY_TTL_MS would let the
+    // on-disk TTL fire before the in-process timeout, leaving the batch in
+    // `dispatching` until next boot's recovery sweep — defeats the timeout.
+    min: 30_000,
+    max: REPLAY_TTL_MS,
+  });
+
   return {
     accountId: _accountId ?? null,
     url: section.url,
@@ -272,7 +299,22 @@ export function resolveAccount(
     allowFrom: section.allowFrom ?? [],
     botSessionId: section.botSessionId ?? null,
     routes,
+    debounceMs,
+    agentTimeoutMs,
   };
+}
+
+function readBoundedInt(
+  raw: unknown,
+  opts: { field: string; default: number; min: number; max: number },
+): number {
+  if (raw === undefined || raw === null) return opts.default;
+  if (!Number.isInteger(raw) || (raw as number) < opts.min || (raw as number) > opts.max) {
+    throw new Error(
+      `odoo: ${opts.field}: must be an integer in [${opts.min}, ${opts.max}] (got ${JSON.stringify(raw)})`,
+    );
+  }
+  return raw as number;
 }
 
 export const odooPlugin = createChatChannelPlugin<ResolvedOdooAccount>({

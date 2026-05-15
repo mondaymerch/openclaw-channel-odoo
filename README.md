@@ -44,6 +44,15 @@ Minimal `openclaw.json`:
       "webhookSecret": "<shared-bearer-token>",
       "webhookPath": "/openclaw/inbound",
 
+      // Optional inbox tunables (defaults shown):
+      //   debounceMs:     window after the first inbound msg before
+      //                   flushing the batch to the agent. Range [0, 60000].
+      //   agentTimeoutMs: hard cap on one dispatch attempt (agent run +
+      //                   delivery). Also the staleness boundary used by
+      //                   boot recovery. Range [30000, 3600000].
+      "debounceMs": 3000,
+      "agentTimeoutMs": 900000,
+
       "routes": [
         {
           "match": "*",

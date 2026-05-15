@@ -47,6 +47,11 @@ export const REPLAY_TTL_MS: number = 60 * 60 * 1000;         // 1h
 export const HARD_TIMEOUT_MS: number = 15 * 60 * 1000;       // 15min
 export const AGENT_RUN_TIMEOUT_MS: number = HARD_TIMEOUT_MS;
 
+/** Default inbound debounce window — how long the debouncer waits after the
+ *  first inbound message before flushing the batch to the agent. Overridable
+ *  per-install via `channels.odoo.debounceMs`. */
+export const INBOUND_DEBOUNCE_MS: number = 3000;             // 3s
+
 /** Spacing between immediately-eligible `received` batches at boot
  *  recovery. Flat 200ms — prevents dogpiling the agent concurrency lane
  *  when many batches were left on disk by the previous gateway. */

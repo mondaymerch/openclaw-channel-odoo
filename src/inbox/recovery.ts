@@ -13,6 +13,7 @@
  * proceeds on its own timers afterward.
  */
 
+import { logMessageProcessed } from "openclaw/plugin-sdk/text-runtime";
 import type { BatchRef, InboxQueue } from "./queue.js";
 import type { RetryScheduler } from "./scheduler.js";
 import { listBatches, type InboxQueuePaths } from "./store.js";
@@ -90,6 +91,15 @@ export async function runBootRecovery(
     ) {
       await queue.moveBatchToFailed(ref);
       summary.expired += 1;
+      // Telemetry: TTL-expired terminal failure. Distinct `reason` from the
+      // scheduler's cap_exhausted path so dashboards can split the two.
+      logMessageProcessed({
+        channel: "odoo",
+        sessionKey: `odoo:${batch.model}:${batch.res_id}`,
+        outcome: "error",
+        reason: "ttl_expired",
+        durationMs: tNow - batch.enqueuedAt,
+      });
       logger.error(
         `[odoo] inbox.recovery expired batchKey=${batch.batchKey} ` +
           `enqueuedAt=${batch.enqueuedAt} ageMs=${tNow - batch.enqueuedAt}`,

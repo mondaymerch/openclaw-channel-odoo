@@ -15,6 +15,11 @@
  * this module. When a batch is abandoned, the scheduler just logs.
  */
 
+import {
+  diagnosticLogger,
+  logMessageProcessed,
+  logRunAttempt,
+} from "openclaw/plugin-sdk/text-runtime";
 import type { BatchRef, InboxQueue } from "./queue.js";
 import { readBatch, type InboxQueuePaths } from "./store.js";
 import {
@@ -142,9 +147,45 @@ export function createRetryScheduler(deps: CreateRetrySchedulerDeps): RetrySched
       if (!updated) return;     // race: file gone
 
       const action = nextAction(updated, failureClass);
-      if (action.kind === "abandon") {
+      const willAbandon = action.kind === "abandon";
+
+      // Event 3a — typed retry-counter (always flows to OTEL via run.attempt
+      // counter; label cardinality is bounded by DISPATCH_MAX+DELIVERY_MAX).
+      logRunAttempt({
+        sessionKey: `odoo:${updated.model}:${updated.res_id}`,
+        runId: updated.batchKey,
+        attempt: updated.dispatchAttempts + updated.deliveryAttempts,
+      });
+
+      // Event 3b — structured per-failure log. Flows to OTEL as a structured
+      // log line only when `config.diagnostics.otel.logs=true`; otherwise
+      // stays as a local log entry.
+      diagnosticLogger.info("inbox.failure", {
+        batchKey: updated.batchKey,
+        model: updated.model,
+        resId: updated.res_id,
+        failureClass,
+        dispatchAttempts: updated.dispatchAttempts,
+        deliveryAttempts: updated.deliveryAttempts,
+        willAbandon,
+        nextDelayMs: willAbandon ? null : action.delayMs,
+        errorMessage: truncate(formatError(err), 200),
+      });
+
+      if (willAbandon) {
         cancel(ref.batchKey);   // drop any stale timer
         await queue.moveBatchToFailed(ref);
+        // Event 2b — terminal failure (cap exhausted). `reason` carries the
+        // failure class; surfaces as a span attribute in otel-diagnostics
+        // (not a Prom label — query via TraceQL for per-class slicing).
+        logMessageProcessed({
+          channel: "odoo",
+          sessionKey: `odoo:${updated.model}:${updated.res_id}`,
+          outcome: "error",
+          reason: `cap_exhausted:${failureClass}`,
+          error: updated.lastError ?? undefined,
+          durationMs: Date.now() - updated.enqueuedAt,
+        });
         logger.error(
           `[odoo] inbox.abandoned batchKey=${ref.batchKey} class=${failureClass} ` +
             `dispatchAttempts=${updated.dispatchAttempts} ` +
@@ -172,4 +213,8 @@ function formatError(err: unknown): string {
   } catch {
     return String(err);
   }
+}
+
+function truncate(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max) + "…" : s;
 }

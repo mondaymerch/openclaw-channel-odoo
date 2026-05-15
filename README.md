@@ -93,6 +93,34 @@ For per-model routing, agent overrides, custom reply methods, and the variable s
 
 ---
 
+## Telemetry
+
+The plugin emits structured OTEL events at lifecycle transitions via openclaw's diagnostic-events SDK. When `@openclaw/otel-diagnostics` is installed and configured, these flow to your OTLP backend automatically:
+
+| Event | Where | Produces |
+|---|---|---|
+| `message.queued` | After webhook persists a new batch | Counter `openclaw.message.queued{channel,source}` |
+| `message.processed{outcome=completed}` | After XML-RPC delivery succeeds | Counter + `openclaw.message.duration_ms` histogram |
+| `message.processed{outcome=error}` | After cap-exhaustion (scheduler) OR TTL expiry (recovery) | Counter + span with `reason` attribute |
+| `run.attempt` | Per recorded failure (scheduler) | Counter `openclaw.run.attempt{attempt=N}` |
+| `inbox.failure` (structured log) | Per recorded failure (scheduler) | OTLP log with `failureClass`, attempt counters, `willAbandon`, `nextDelayMs` |
+
+**Dependencies:**
+
+- Telemetry is auto-collected by `@openclaw/otel-diagnostics` — install it and set `config.diagnostics.otel.endpoint` to ship events to your OTLP backend.
+- The plugin is **safe to run without `@openclaw/otel-diagnostics`** — the helpers are no-ops when no event listener is registered. No crash, no extra log noise on the gateway.
+- The `inbox.failure` structured log flows to OTEL only when `config.diagnostics.otel.logs = true` in the otel-diagnostics config (default OFF). Without this, the log line is still written to the gateway's local logs via `diagnosticLogger`.
+
+**Per-failure-class breakdown in Grafana.** The `reason` field on `message.processed{outcome=error}` lives in span attributes (not metric labels). Query via TraceQL on a tracing backend (Tempo/Jaeger):
+
+```traceql
+{ openclaw.outcome="error" } | count() by(openclaw.reason)
+```
+
+Two distinct `reason` values are emitted: `cap_exhausted:<failureClass>` (scheduler, when retries are exhausted) and `ttl_expired` (boot recovery, when a batch sat on disk longer than the 1-hour TTL).
+
+---
+
 ## License
 
 [MIT](LICENSE) · © Monday Merch B.V.

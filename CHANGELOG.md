@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (pre-1.0: minor bumps may contain breaking changes).
 
+## [Unreleased]
+
+### Added
+
+- **OTEL telemetry via openclaw diagnostic events.** Three conceptual events emitted at lifecycle transitions: `message.queued` on persist, `message.processed{outcome}` on terminal state (completed or error), and `run.attempt` + structured `inbox.failure` log per failure. Auto-collected by `@openclaw/otel-diagnostics` (no plugin-side OTLP wiring).
+
+  Five emission sites:
+  - `webhook-handler.ts` — `logMessageQueued` after a new batch is persisted (gated on `didCreate=true` so batch appends don't double-count).
+  - `dispatch.ts` ×2 — `logMessageProcessed{outcome="completed", durationMs}` after each `recordDeliverySuccess` (reply_ready re-delivery + main success path).
+  - `scheduler.ts` (`handleFailure`) — `logRunAttempt` + `diagnosticLogger.info("inbox.failure", …)` on every recorded failure, then `logMessageProcessed{outcome="error", reason="cap_exhausted:<class>", durationMs}` if the cap is hit.
+  - `recovery.ts` — `logMessageProcessed{outcome="error", reason="ttl_expired", durationMs}` for batches moved to `failed/` because their TTL elapsed before delivery.
+
+  What flows to the OTEL backend (via `@openclaw/otel-diagnostics`):
+  - **Counters:** `openclaw.message.queued{channel,source}`, `openclaw.message.processed{channel,outcome}`, `openclaw.run.attempt{attempt}`.
+  - **Histogram:** `openclaw.message.duration_ms` (end-to-end webhook→delivery latency).
+  - **Span attributes** on `openclaw.message.processed` spans: `openclaw.sessionKey`, `openclaw.chatId`, `openclaw.reason` (failure class). Per-class slicing of errors is queryable in tracing backends (TraceQL/Jaeger), not in Prometheus.
+  - **Structured OTLP log:** `inbox.failure` with `failureClass`, `dispatchAttempts`, `deliveryAttempts`, `willAbandon`, `nextDelayMs`. Requires `config.diagnostics.otel.logs = true` to forward to OTEL; otherwise stays as gateway-local log.
+
+  The helpers are no-ops when no event listener is registered, so the plugin is safe to run on a vanilla openclaw without `@openclaw/otel-diagnostics` installed.
+
+  See the new "Telemetry" section in the README for details on the dependency model and the Grafana query for per-class failure breakdown.
+
+### Changed
+
+- **`peerDependencies.openclaw` bumped from `>=2026.3.24` to `>=2026.4.15`.** The diagnostic helpers (`logMessageQueued`, `logMessageProcessed`, `logRunAttempt`, `diagnosticLogger`) are confirmed present in 2026.4.15+; older versions may not export them, which would fail at module import time.
+
 ## [0.4.0-beta] — 2026-05-13
 
 Pre-release. Installs only via `npm install openclaw-channel-odoo@beta`; the stable `latest` dist-tag continues to point at 0.3.1.

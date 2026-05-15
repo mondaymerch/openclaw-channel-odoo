@@ -183,7 +183,7 @@ The agent already produced text on a prior attempt; we just need to deliver it a
 
 1. **CAS**: `queue.markDispatching(ref)` reads under the per-record lock; if `state !== "received"` returns `{ ok: false, reason: "not_received" }`. The caller logs and returns — another path is already handling this batch.
 2. On `{ ok: true, batch }`: state is now `"dispatching"`, `inFlightSince = now()`, `closedAt` set if it wasn't already.
-3. **Agent dispatch**: route resolution + per-route agentId override + session record + `rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher` wrapped in `Promise.race` against `HARD_TIMEOUT_MS` (15 min).
+3. **Agent dispatch**: route resolution + per-route agentId override + session record + `rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher` wrapped in `Promise.race` against `HARD_TIMEOUT_MS` (default 15 min, override via `channels.odoo.agentTimeoutMs`).
 4. **Deliver callback**: when the agent produces text, our wrapped `deliver` runs `queue.transitionToReplyReady(ref, text)` (state → `"reply_ready"`, `reply.text` checkpointed, `inFlightSince` cleared), then `postViaCallReply`, then `queue.recordDeliverySuccess` (unlink). A `callReply` throw is caught and routed through `scheduler.handleFailure(ref, "xmlrpc_failure", err)`. `deliverOutcome` flag tracks whether deliver fired and how, so the outer race resolution doesn't double-classify.
 5. **Race resolution**:
    - `{ kind: "timeout" }` with `deliverOutcome === null` → `handleFailure(internal_error)`. The original dispatch promise is left running; if its deliver eventually fires, it races against any retry.
@@ -238,7 +238,7 @@ Partition pass (single iteration over `listBatches(paths)`):
 1. **Expire** — `state !== "reply_ready" && now - enqueuedAt > REPLAY_TTL_MS` (1 h) → `moveBatchToFailed`, bump `summary.expired`.
 2. **eligibleReplyReady** — `state === "reply_ready"` → `scheduleAt(batch, 0)`. No stagger, no backoff respect, no TTL. Faster delivery is strictly better than letting a typed reply rot.
 3. **dispatching** — split by `inFlightSince` freshness:
-   - Fresh (`now - inFlightSince < AGENT_RUN_TIMEOUT_MS`) → `scheduleAt(batch, inFlightSince + 15min - now)`, bump `summary.deferred`. The previous process is presumed still running this dispatch; wait for the staleness boundary.
+   - Fresh (`now - inFlightSince < agentTimeoutMs`) → `scheduleAt(batch, inFlightSince + agentTimeoutMs - now)`, bump `summary.deferred`. The previous process is presumed still running this dispatch; wait for the staleness boundary.
    - Stale → call `queue.recordFailure(ref, "internal_error", "stale dispatching marker")` synchronously. This flips state back to `received`, bumps `dispatchAttempts`, clears `inFlightSince`, sets `lastAttemptAt = now()`. Then falls through to the received-path logic below. The counter bump gives gateway-flapping a real bound (`DISPATCH_MAX_ATTEMPTS = 3`).
 4. **received** — split by next-eligible-at:
    - `lastAttemptAt + backoff[counter - 1] > now` → `scheduleAt(batch, residual)`, bump `summary.notYetEligibleReceived`.
@@ -284,28 +284,28 @@ The next `writeBatch` after a normalized read drops the legacy `dispatchedAt` ke
 
 ## Configuration
 
-All defined in `src/inbox/types.ts`:
+All defaults defined in `src/inbox/types.ts`:
 
-| Constant | Default | Purpose |
-|---|---|---|
-| `REPLAY_TTL_MS` | 1 h | Batches in `state !== "reply_ready"` older than this expire to `failed/` at boot. |
-| `HARD_TIMEOUT_MS` | 15 min | Plugin-side hard timeout on `dispatchReplyWithBufferedBlockDispatcher`. Equals `AGENT_RUN_TIMEOUT_MS`. |
-| `AGENT_RUN_TIMEOUT_MS` | 15 min | Boot-recovery staleness boundary for `dispatching` batches. Equals `HARD_TIMEOUT_MS`. |
-| `REPLAY_STAGGER_MS` | 200 ms | Inter-batch cadence for staggered immediately-eligible received batches at boot. |
-| `DISPATCH_MAX_ATTEMPTS` | 3 | Cap on `dispatchAttempts` (silent + internal_error). |
-| `DELIVERY_MAX_ATTEMPTS` | 5 | Cap on `deliveryAttempts` (xmlrpc_failure). |
-| `DISPATCH_BACKOFF_MS` | `[30s, 120s]` | Per-attempt backoff for silent + internal_error. |
-| `DELIVERY_BACKOFF_MS` | `[5s, 25s, 120s, 600s]` | Per-attempt backoff for xmlrpc_failure (matches openclaw outbound queue). |
+| Constant | Default | Purpose | Configurable? |
+|---|---|---|---|
+| `REPLAY_TTL_MS` | 1 h | Batches in `state !== "reply_ready"` older than this expire to `failed/` at boot. | No |
+| `HARD_TIMEOUT_MS` | 15 min | Plugin-side hard timeout on `dispatchReplyWithBufferedBlockDispatcher`. Equals `AGENT_RUN_TIMEOUT_MS`. | **Yes — `channels.odoo.agentTimeoutMs`** |
+| `AGENT_RUN_TIMEOUT_MS` | 15 min | Boot-recovery staleness boundary for `dispatching` batches. Equals `HARD_TIMEOUT_MS`. | **Yes — `channels.odoo.agentTimeoutMs`** (same knob) |
+| `INBOUND_DEBOUNCE_MS` | 3 s | Debouncer flush quiescence window. | **Yes — `channels.odoo.debounceMs`** |
+| `REPLAY_STAGGER_MS` | 200 ms | Inter-batch cadence for staggered immediately-eligible received batches at boot. | No |
+| `DISPATCH_MAX_ATTEMPTS` | 3 | Cap on `dispatchAttempts` (silent + internal_error). | No |
+| `DELIVERY_MAX_ATTEMPTS` | 5 | Cap on `deliveryAttempts` (xmlrpc_failure). | No |
+| `DISPATCH_BACKOFF_MS` | `[30s, 120s]` | Per-attempt backoff for silent + internal_error. | No |
+| `DELIVERY_BACKOFF_MS` | `[5s, 25s, 120s, 600s]` | Per-attempt backoff for xmlrpc_failure (matches openclaw outbound queue). | No |
 
 Other plugin constants in `index.ts`:
 
-| Constant | Default | Purpose |
-|---|---|---|
-| `INBOUND_DEBOUNCE_MS` | 3 s | Debouncer flush quiescence window. |
-| `DEDUPE_TTL_MS` | 2 min | In-memory dedup cache TTL. |
-| `DEDUPE_MAX_SIZE` | 10 000 | In-memory dedup cache capacity. |
+| Constant | Default | Purpose | Configurable? |
+|---|---|---|---|
+| `DEDUPE_TTL_MS` | 2 min | In-memory dedup cache TTL. | No |
+| `DEDUPE_MAX_SIZE` | 10 000 | In-memory dedup cache capacity. | No |
 
-The hard timeout / staleness boundary is the only value that's intended to be configurable; the rest are hardcoded. (Plumbing for a `dispatchTimeoutMs` config knob is not currently wired through to the type and recovery constants.)
+**`agentTimeoutMs` is bounded by `[30_000, REPLAY_TTL_MS]`** at config-load time — a value above the TTL would let the on-disk expiry fire before the in-process timeout, leaving a batch in `dispatching` until the next boot's recovery sweep.
 
 ## Fault model
 

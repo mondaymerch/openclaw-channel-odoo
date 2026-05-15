@@ -12,7 +12,7 @@
 
 ---
 
-An [OpenClaw](https://openclaw.dev) channel plugin that wires OpenClaw agents into Odoo. Any Odoo event — a button click, a chat input, a cron — can hand off to an agent, and the agent's output can flow back into Odoo as a chatter message, a newly created record, a field update, or anything else callable via XML-RPC.
+An [OpenClaw](https://openclaw.ai) channel plugin that wires OpenClaw agents into Odoo. Any Odoo event - a button click, a chat input, a cron - can hand off to an agent, and the agent's output can flow back into Odoo as a chatter message, a newly created record, a field update, or anything else callable via XML-RPC.
 
 - 🪝 **Inbound**: any Odoo trigger → agent (auth'd, deduped, debounced)
 - 📤 **Outbound**: agent output → any Odoo method, configurable per model
@@ -91,6 +91,18 @@ For per-model routing, agent overrides, custom reply methods, and the variable s
 2. Your Odoo-side controller POSTs the trigger to the plugin's webhook (Bearer-auth'd)
 3. Plugin routes the message to an agent (optionally per-model)
 4. Agent does its thing and produces output; plugin calls back into Odoo via the method configured for that model
+
+---
+
+## Related X/Twitter workflows
+
+Odoo can keep CRM records, approvals, and internal notes while TweetClaw handles X/Twitter work in the same OpenClaw workspace:
+
+- Monitor tweets, search tweets, and search tweet replies, then post summaries or action items back to Odoo leads or tickets through this channel
+- Export followers, look up users, download media, or run giveaway draws before updating an Odoo record
+- Prepare post tweets or post tweet replies with human approval in TweetClaw, then store the approved status, campaign note, or support follow-up in Odoo
+
+Install TweetClaw with `openclaw plugins install @xquik/tweetclaw`. Use the [TweetClaw GitHub repo](https://github.com/Xquik-dev/tweetclaw) or [npm package](https://www.npmjs.com/package/@xquik/tweetclaw) for setup; the [ClawHub page](https://clawhub.ai/plugins/@xquik/tweetclaw) is useful for discovery while its listing can lag npm.
 
 ---
 

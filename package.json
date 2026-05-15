@@ -33,6 +33,12 @@
     "install": {
       "npmSpec": "openclaw-channel-odoo",
       "defaultChoice": "npm"
+    },
+    "compat": {
+      "pluginApi": ">=2026.4.15"
+    },
+    "build": {
+      "openclawVersion": "2026.4.15"
     }
   },
   "keywords": [

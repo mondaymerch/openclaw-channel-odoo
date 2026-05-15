@@ -11,6 +11,7 @@
  */
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
+import { logMessageProcessed } from "openclaw/plugin-sdk/text-runtime";
 import {
   buildAgentSessionKey,
   buildAgentMainSessionKey,
@@ -156,6 +157,13 @@ export function createDispatchHandler(deps: CreateDispatchHandlerDeps): Dispatch
           try {
             await postViaCallReply(getOdooClient, matched, account, clientConfig, batch, batch.reply.text);
             await queue.recordDeliverySuccess(ref);
+            logMessageProcessed({
+              channel: CHANNEL_ID,
+              sessionKey: `${CHANNEL_ID}:${batch.model}:${batch.res_id}`,
+              chatId: `${batch.model},${batch.res_id}`,
+              outcome: "completed",
+              durationMs: Date.now() - batch.enqueuedAt,
+            });
           } catch (err) {
             await scheduler.handleFailure(ref, "xmlrpc_failure", err);
           }
@@ -300,6 +308,13 @@ export function createDispatchHandler(deps: CreateDispatchHandlerDeps): Dispatch
               try {
                 await postViaCallReply(getOdooClient, matched, account, clientConfig, batch, text);
                 await queue.recordDeliverySuccess(ref);
+                logMessageProcessed({
+                  channel: CHANNEL_ID,
+                  sessionKey: `${CHANNEL_ID}:${batch.model}:${batch.res_id}`,
+                  chatId: `${batch.model},${batch.res_id}`,
+                  outcome: "completed",
+                  durationMs: Date.now() - batch.enqueuedAt,
+                });
                 deliverOutcome = "success";
               } catch (xmlErr) {
                 await scheduler.handleFailure(ref, "xmlrpc_failure", xmlErr);

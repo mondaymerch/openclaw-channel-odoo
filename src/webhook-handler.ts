@@ -11,8 +11,9 @@ import {
   readJsonBodyWithLimit,
   DEFAULT_WEBHOOK_MAX_BODY_BYTES,
 } from "openclaw/plugin-sdk/infra-runtime";
+import { logMessageQueued } from "openclaw/plugin-sdk/text-runtime";
 import { resolveOdooSection } from "./channel.js";
-import type { InboundMessage, PluginApi } from "./dispatch.js";
+import { CHANNEL_ID, type InboundMessage, type PluginApi } from "./dispatch.js";
 import type { InboxQueue } from "./inbox/queue.js";
 
 type DedupeCache = ReturnType<typeof createDedupeCache>;
@@ -143,6 +144,15 @@ export function createWebhookHandler(deps: {
       `[odoo] Inbound from ${user_name ?? "unknown"} on ${model},${res_id} ` +
         `batchKey=${result.batchKey} didCreate=${result.didCreate}`,
     );
+    // Telemetry: gate on didCreate so appends to an existing batch don't
+    // re-emit "queued" (would double-count batches as inbound).
+    if (result.didCreate) {
+      logMessageQueued({
+        sessionKey: `${CHANNEL_ID}:${model}:${res_id}`,
+        channel: CHANNEL_ID,
+        source: "webhook",
+      });
+    }
     respond(202, { accepted: true, message_id, batchKey: result.batchKey });
 
     // Debouncer batches rapid messages to the same record; onFlush

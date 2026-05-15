@@ -4,9 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (pre-1.0: minor bumps may contain breaking changes).
 
-## [Unreleased]
+## [0.4.0] — 2026-05-15
 
-### Added
+Promotes [0.4.0-beta](#040-beta--2026-05-13) to the stable `latest` dist-tag. `npm install openclaw-channel-odoo` now resolves to 0.4.0; existing 0.3.1 installs are unaffected until they upgrade.
+
+The headline feature — the **persistent inbox** for at-least-once delivery of inbound chatter messages across gateway restarts — was introduced and documented in 0.4.0-beta. The full design (state machine, data model, scheduler/recovery semantics, concurrency model, known limitations) lives in [`persistent-inbox-spec.md`](persistent-inbox-spec.md).
+
+### Added (since 0.4.0-beta)
 
 - **OTEL telemetry via openclaw diagnostic events.** Three conceptual events emitted at lifecycle transitions: `message.queued` on persist, `message.processed{outcome}` on terminal state (completed or error), and `run.attempt` + structured `inbox.failure` log per failure. Auto-collected by `@openclaw/otel-diagnostics` (no plugin-side OTLP wiring).
 
@@ -26,9 +30,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
   See the new "Telemetry" section in the README for details on the dependency model and the Grafana query for per-class failure breakdown.
 
-### Changed
+### Changed (since 0.4.0-beta)
 
 - **`peerDependencies.openclaw` bumped from `>=2026.3.24` to `>=2026.4.15`.** The diagnostic helpers (`logMessageQueued`, `logMessageProcessed`, `logRunAttempt`, `diagnosticLogger`) are confirmed present in 2026.4.15+; older versions may not export them, which would fail at module import time.
+
+### CI (since 0.4.0-beta)
+
+- **Test suite now runs in CI** on every PR + push to main (136 tests across 8 files). Previously CI only ran type-check + build. Implementation uses `npm install --no-save tsx@^4.21.0` so the lockfile stays pristine across platforms (Mac can't compile openclaw's optional `@discordjs/opus` native binding, which would otherwise desync the lockfile between local dev and Linux CI).
 
 ## [0.4.0-beta] — 2026-05-13
 

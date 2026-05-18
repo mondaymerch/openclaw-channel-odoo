@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **Routing-key route matching.** Inbound webhooks may carry an optional `routingKey` (or `routing_key`) field; routes can match on it with `{ routingKey: "<glob>" }` or combined `{ model: "<glob>", routingKey: "<glob>" }` (AND-semantics). Same `*` glob syntax as model matches. Existing model-only routes and Odoo controllers continue to work unchanged.
+
+  **Batch identity is now `(model, res_id, routing_key)`.** Two messages on the same record with different routing keys form independent persistent-inbox batches: separate debounce windows, separate agent runs. Messages with the same key (or both absent) still batch together as before.
+
+  `routingKey` joins the known variables namespace — references like `["body", "routingKey"]` in `reply.args` and `"$routingKey"` in `reply.kwargs` resolve to the inbound's value (or `null` when absent). The prompt header gains a `routing_key="..."` field when the inbound supplied one (skipped otherwise, same convention as `user_name`).
+
+  Configs are camelCase-only (`routingKey`); payloads accept both `routingKey` and `routing_key` so Odoo controllers can use whichever feels natural. On-disk batches written before this change load with `routing_key: null` automatically — no manual migration.
+
 - **`channels.odoo.debounceMs` and `channels.odoo.agentTimeoutMs` are now config-tunable.** Both optional with current defaults preserved (3000 ms and 900_000 ms / 15 min respectively). Operators can tighten the debounce for low-volume records or extend the agent timeout for heavier reasoning without forking the plugin.
   - `debounceMs` accepts integers in `[0, 60000]`.
   - `agentTimeoutMs` accepts integers in `[30000, REPLAY_TTL_MS]` (i.e. ≤ 1 h). Values above that would let the on-disk TTL fire before the in-process timeout, leaving the batch in `dispatching` until the next boot's recovery sweep — rejected at startup with a clear error.

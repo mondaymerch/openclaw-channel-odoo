@@ -25,7 +25,13 @@ export const CHANNEL_ID = "odoo";
 
 // Variables available as references in route.reply.args / route.reply.kwargs.
 // Kept in sync with the argMap built in client.callReply.
-const KNOWN_VARIABLES = ["body", "requestMessageId", "model", "resId"] as const;
+const KNOWN_VARIABLES = [
+  "body",
+  "requestMessageId",
+  "model",
+  "resId",
+  "routingKey",
+] as const;
 type KnownVariable = (typeof KNOWN_VARIABLES)[number];
 
 export type KwargValue =
@@ -34,7 +40,15 @@ export type KwargValue =
 
 type RouteMatch =
   | { kind: "catchall" }
-  | { kind: "model"; regex: RegExp; pattern: string };
+  | { kind: "model"; regex: RegExp; pattern: string }
+  | { kind: "routingKey"; regex: RegExp; pattern: string }
+  | {
+      kind: "both";
+      modelRegex: RegExp;
+      modelPattern: string;
+      routingKeyRegex: RegExp;
+      routingKeyPattern: string;
+    };
 
 export type CompiledReply = {
   method: string;
@@ -94,7 +108,7 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function compileModelGlob(pattern: string): RegExp {
+function compileGlob(pattern: string): RegExp {
   // Split on "*" so each segment can be escaped independently; rejoin with ".*"
   const source = pattern.split("*").map(escapeRegex).join(".*");
   return new RegExp(`^${source}$`);
@@ -169,13 +183,47 @@ function compileReply(raw: unknown, routePath: string): CompiledReply {
 function compileMatch(raw: unknown, routePath: string): RouteMatch {
   if (raw === "*") return { kind: "catchall" };
   if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
-    const { model } = raw as Record<string, unknown>;
-    if (typeof model !== "string" || !model.trim()) {
+    const { model, routingKey } = raw as Record<string, unknown>;
+    const hasModel = model !== undefined;
+    const hasRoutingKey = routingKey !== undefined;
+    if (!hasModel && !hasRoutingKey) {
+      throw new Error(
+        `odoo: ${routePath}.match: object must include "model" and/or "routingKey"`,
+      );
+    }
+    if (hasModel && (typeof model !== "string" || !model.trim())) {
       throw new Error(`odoo: ${routePath}.match.model: required non-empty string`);
     }
-    return { kind: "model", regex: compileModelGlob(model), pattern: model };
+    if (hasRoutingKey && (typeof routingKey !== "string" || !routingKey.trim())) {
+      throw new Error(
+        `odoo: ${routePath}.match.routingKey: required non-empty string`,
+      );
+    }
+    if (hasModel && hasRoutingKey) {
+      return {
+        kind: "both",
+        modelRegex: compileGlob(model as string),
+        modelPattern: model as string,
+        routingKeyRegex: compileGlob(routingKey as string),
+        routingKeyPattern: routingKey as string,
+      };
+    }
+    if (hasModel) {
+      return {
+        kind: "model",
+        regex: compileGlob(model as string),
+        pattern: model as string,
+      };
+    }
+    return {
+      kind: "routingKey",
+      regex: compileGlob(routingKey as string),
+      pattern: routingKey as string,
+    };
   }
-  throw new Error(`odoo: ${routePath}.match: must be "*" or { model: "<glob>" }`);
+  throw new Error(
+    `odoo: ${routePath}.match: must be "*", { model: "<glob>" }, { routingKey: "<glob>" }, or { model, routingKey }`,
+  );
 }
 
 export function compileRoutes(raw: unknown): CompiledRoute[] {
@@ -221,16 +269,32 @@ export function compileRoutes(raw: unknown): CompiledRoute[] {
   return out;
 }
 
-export function findRouteForModel(
+export function findRouteForInbound(
   routes: CompiledRoute[],
-  model: string,
+  inbound: { model: string; routingKey?: string | null },
 ): CompiledRoute {
+  const { model, routingKey } = inbound;
+  const hasKey = routingKey !== undefined && routingKey !== null;
   for (const route of routes) {
-    if (route.match.kind === "catchall") return route;
-    if (route.match.regex.test(model)) return route;
+    const m = route.match;
+    if (m.kind === "catchall") return route;
+    if (m.kind === "model" && m.regex.test(model)) return route;
+    if (m.kind === "routingKey" && hasKey && m.regex.test(routingKey)) {
+      return route;
+    }
+    if (
+      m.kind === "both" &&
+      m.modelRegex.test(model) &&
+      hasKey &&
+      m.routingKeyRegex.test(routingKey)
+    ) {
+      return route;
+    }
   }
   // Unreachable: compileRoutes guarantees a catchall at the end.
-  throw new Error(`odoo: no route matched model "${model}"`);
+  throw new Error(
+    `odoo: no route matched model "${model}" routingKey "${routingKey ?? ""}"`,
+  );
 }
 
 // Accepts either "model:resId" (bare) or "odoo:record:model:resId" (with
@@ -396,7 +460,10 @@ export const odooPlugin = createChatChannelPlugin<ResolvedOdooAccount>({
         }
         const { model, resId } = parsed;
 
-        const route = findRouteForModel(account.routes, model);
+        // outbound-only path (manual reply from another channel) — no routing
+        // key context here. Routes that gate on routingKey simply don't match
+        // and we fall through to the catchall.
+        const route = findRouteForInbound(account.routes, { model });
 
         // requestMessageId comes from the inbound context (ReplyToId), set in
         // dispatch.ts when the batch is dispatched.

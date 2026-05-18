@@ -8,7 +8,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { resolveAccount } from "../src/channel.js";
+import {
+  compileRoutes,
+  findRouteForInbound,
+  resolveAccount,
+} from "../src/channel.js";
 import {
   HARD_TIMEOUT_MS,
   INBOUND_DEBOUNCE_MS,
@@ -104,4 +108,181 @@ test("agentTimeoutMs > REPLAY_TTL_MS is rejected (would let TTL fire before time
 test("agentTimeoutMs exactly at REPLAY_TTL_MS is accepted (boundary)", () => {
   const account = resolveAccount(buildCfg({ agentTimeoutMs: REPLAY_TTL_MS }));
   assert.equal(account.agentTimeoutMs, REPLAY_TTL_MS);
+});
+
+// ===========================================================================
+// compileMatch — routing-key validation
+// ===========================================================================
+
+const VALID_REPLY = {
+  method: "message_post",
+  args: ["body", "requestMessageId"],
+};
+
+function withMatches(matches: unknown[]): { routes: unknown[] } {
+  return {
+    routes: [
+      ...matches.map((m) => ({ match: m, reply: VALID_REPLY })),
+      { match: "*", reply: VALID_REPLY }, // catchall trailer required
+    ],
+  };
+}
+
+test("compileMatch: { routingKey: '<glob>' } is accepted", () => {
+  const cfg = buildCfg(withMatches([{ routingKey: "purchase.receipt.*" }]));
+  assert.doesNotThrow(() => resolveAccount(cfg));
+});
+
+test("compileMatch: { model: '<glob>', routingKey: '<glob>' } is accepted (AND)", () => {
+  const cfg = buildCfg(
+    withMatches([{ model: "crm.lead", routingKey: "first_contact" }]),
+  );
+  assert.doesNotThrow(() => resolveAccount(cfg));
+});
+
+test("compileMatch: bare non-catchall string is rejected (no shorthand)", () => {
+  const cfg = buildCfg(withMatches(["purchase.receipt.scheduled_date_response"]));
+  assert.throws(
+    () => resolveAccount(cfg),
+    /must be "\*", \{ model: "<glob>" \}, \{ routingKey: "<glob>" \}/,
+  );
+});
+
+test("compileMatch: empty match object is rejected", () => {
+  const cfg = buildCfg(withMatches([{}]));
+  assert.throws(
+    () => resolveAccount(cfg),
+    /must include "model" and\/or "routingKey"/,
+  );
+});
+
+test("compileMatch: empty-string routingKey is rejected", () => {
+  const cfg = buildCfg(withMatches([{ routingKey: "" }]));
+  assert.throws(() => resolveAccount(cfg), /routingKey: required non-empty string/);
+});
+
+test("compileMatch: non-string routingKey is rejected", () => {
+  const cfg = buildCfg(withMatches([{ routingKey: 123 }]));
+  assert.throws(() => resolveAccount(cfg), /routingKey: required non-empty string/);
+});
+
+// ===========================================================================
+// findRouteForInbound — resolution semantics
+// ===========================================================================
+
+function r(match: unknown, agentId: string) {
+  return {
+    match,
+    agentId,
+    reply: { method: "message_post", args: ["body", "requestMessageId"] },
+  };
+}
+
+test("findRouteForInbound: { model, routingKey } combined match wins over model-only", () => {
+  const routes = compileRoutes([
+    r({ model: "crm.lead", routingKey: "first_contact" }, "onboarding"),
+    r({ routingKey: "*.urgent" }, "escalation"),
+    r({ model: "crm.lead" }, "lead_handler"),
+    r("*", "catchall"),
+  ]);
+  const hit = findRouteForInbound(routes, {
+    model: "crm.lead",
+    routingKey: "first_contact",
+  });
+  assert.equal(hit.agentId, "onboarding");
+});
+
+test("findRouteForInbound: routingKey-only route matches across models", () => {
+  const routes = compileRoutes([
+    r({ model: "crm.lead", routingKey: "first_contact" }, "onboarding"),
+    r({ routingKey: "*.urgent" }, "escalation"),
+    r({ model: "crm.lead" }, "lead_handler"),
+    r("*", "catchall"),
+  ]);
+  const hit = findRouteForInbound(routes, {
+    model: "helpdesk.ticket",
+    routingKey: "support.urgent",
+  });
+  assert.equal(hit.agentId, "escalation");
+});
+
+test("findRouteForInbound: missing routingKey falls past routing-key routes", () => {
+  const routes = compileRoutes([
+    r({ routingKey: "*.urgent" }, "escalation"),
+    r({ model: "crm.lead" }, "lead_handler"),
+    r("*", "catchall"),
+  ]);
+  const hit = findRouteForInbound(routes, { model: "crm.lead" });
+  assert.equal(hit.agentId, "lead_handler");
+});
+
+test("findRouteForInbound: null routingKey falls past routing-key routes (same as missing)", () => {
+  const routes = compileRoutes([
+    r({ routingKey: "*.urgent" }, "escalation"),
+    r({ model: "crm.lead" }, "lead_handler"),
+    r("*", "catchall"),
+  ]);
+  const hit = findRouteForInbound(routes, {
+    model: "crm.lead",
+    routingKey: null,
+  });
+  assert.equal(hit.agentId, "lead_handler");
+});
+
+test("findRouteForInbound: unmatched model+routingKey lands on catchall", () => {
+  const routes = compileRoutes([
+    r({ model: "crm.lead" }, "lead_handler"),
+    r("*", "catchall"),
+  ]);
+  const hit = findRouteForInbound(routes, {
+    model: "sale.order",
+    routingKey: "anything",
+  });
+  assert.equal(hit.agentId, "catchall");
+});
+
+test("findRouteForInbound: combined match requires BOTH model and routingKey to match", () => {
+  const routes = compileRoutes([
+    r({ model: "crm.lead", routingKey: "first_contact" }, "onboarding"),
+    r({ model: "crm.lead" }, "lead_handler"),
+    r("*", "catchall"),
+  ]);
+  // Model matches, but routingKey doesn't → combined route skips
+  const hit = findRouteForInbound(routes, {
+    model: "crm.lead",
+    routingKey: "different",
+  });
+  assert.equal(hit.agentId, "lead_handler");
+});
+
+test("$routingKey is a known variable in reply args", () => {
+  const cfg = buildCfg({
+    routes: [
+      {
+        match: { routingKey: "test" },
+        reply: {
+          method: "scheduled_date_response",
+          args: ["body", "routingKey"],
+        },
+      },
+      { match: "*", reply: VALID_REPLY },
+    ],
+  });
+  assert.doesNotThrow(() => resolveAccount(cfg));
+});
+
+test("$routingKey is a known variable in reply kwargs ($-prefixed)", () => {
+  const cfg = buildCfg({
+    routes: [
+      {
+        match: { routingKey: "test" },
+        reply: {
+          method: "scheduled_date_response",
+          kwargs: { tag: "$routingKey" },
+        },
+      },
+      { match: "*", reply: VALID_REPLY },
+    ],
+  });
+  assert.doesNotThrow(() => resolveAccount(cfg));
 });

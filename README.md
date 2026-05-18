@@ -72,7 +72,7 @@ Minimal `openclaw.json`:
 
 With the minimal Odoo-side controller (shown in the [configuration guide](docs/configuration.md#odoo-side-setup)), this config routes every inbound message through your agent and posts the reply back to the triggering record's chatter. No custom Odoo methods needed — `message_post` is built in.
 
-For per-model routing, agent overrides, custom reply methods, and the variable system — see the [configuration guide](docs/configuration.md).
+For per-model routing, **routing-key matching** (`{ routingKey: "<glob>" }`), per-route agent overrides, custom reply methods, and the variable system — see the [configuration guide](docs/configuration.md).
 
 ---
 

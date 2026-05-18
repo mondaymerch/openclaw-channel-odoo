@@ -932,3 +932,90 @@ test("CAS4: recordFailure on state=reply_ready leaves state alone, clears inFlig
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// ===========================================================================
+// Routing-key batch identity
+// ===========================================================================
+
+test("routing_key: different keys on same record → separate batches", async () => {
+  const { dir, paths, queue } = await makeQueueHarness({ keys: ["alpha", "beta"] });
+  try {
+    const r1 = await queue.appendOrCreateBatch(
+      sampleInput({ message_id: 100, routing_key: "qualification" }),
+    );
+    const r2 = await queue.appendOrCreateBatch(
+      sampleInput({ message_id: 101, routing_key: "followup" }),
+    );
+    assert.deepEqual(r1, { ok: true, batchKey: "alpha", didCreate: true });
+    assert.deepEqual(r2, { ok: true, batchKey: "beta", didCreate: true });
+
+    const a = await readBatch(paths, "alpha");
+    const b = await readBatch(paths, "beta");
+    assert.equal(a!.routing_key, "qualification");
+    assert.equal(b!.routing_key, "followup");
+    assert.equal(a!.messages.length, 1);
+    assert.equal(b!.messages.length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("routing_key: same key on same record → appends to one batch", async () => {
+  const { dir, paths, queue } = await makeQueueHarness({ keys: ["one"] });
+  try {
+    await queue.appendOrCreateBatch(
+      sampleInput({ message_id: 200, routing_key: "shared" }),
+    );
+    const second = await queue.appendOrCreateBatch(
+      sampleInput({ message_id: 201, routing_key: "shared" }),
+    );
+    assert.deepEqual(second, { ok: true, batchKey: "one", didCreate: false });
+    const batch = await readBatch(paths, "one");
+    assert.equal(batch!.messages.length, 2);
+    assert.equal(batch!.routing_key, "shared");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("routing_key: null-key batch is distinct from a same-record keyed batch", async () => {
+  const { dir, paths, queue } = await makeQueueHarness({
+    keys: ["bare", "tagged"],
+  });
+  try {
+    // First message has no routing_key
+    const r1 = await queue.appendOrCreateBatch(
+      sampleInput({ message_id: 300 }),
+    );
+    // Second message on same record has a routing_key
+    const r2 = await queue.appendOrCreateBatch(
+      sampleInput({ message_id: 301, routing_key: "tagged" }),
+    );
+    assert.deepEqual(r1, { ok: true, batchKey: "bare", didCreate: true });
+    assert.deepEqual(r2, { ok: true, batchKey: "tagged", didCreate: true });
+
+    const a = await readBatch(paths, "bare");
+    const b = await readBatch(paths, "tagged");
+    assert.equal(a!.routing_key, null);
+    assert.equal(b!.routing_key, "tagged");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("routing_key: both-null appends share a batch", async () => {
+  const { dir, paths, queue } = await makeQueueHarness({ keys: ["shared"] });
+  try {
+    await queue.appendOrCreateBatch(sampleInput({ message_id: 400 }));
+    const second = await queue.appendOrCreateBatch(
+      sampleInput({ message_id: 401 }),
+    );
+    assert.deepEqual(second, { ok: true, batchKey: "shared", didCreate: false });
+    const batch = await readBatch(paths, "shared");
+    assert.equal(batch!.messages.length, 2);
+    assert.equal(batch!.routing_key, null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+

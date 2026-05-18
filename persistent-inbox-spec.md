@@ -73,6 +73,9 @@ type InboxBatch = {
   state: MessageState;
   model: string;             // e.g. "crm.lead"
   res_id: number;
+  routing_key: string | null; // batch identity third component; null when the
+                              // inbound webhook didn't supply a routing key.
+                              // See "Batch identity" note below.
   messages: InboundMessage[];
 
   enqueuedAt: Timestamp;     // when the batch was OPENED (first message arrived)
@@ -91,9 +94,16 @@ type InboxBatch = {
 };
 ```
 
+**Batch identity is `(model, res_id, routing_key)`.** `findOpenBatchForRecord` filters candidate files (already narrowed by `${model}__${res_id}__` filename prefix) by `batch.routing_key === routing_key` after read. This means two inbounds on the same record with different routing keys land in independent batches with their own debounce window, agent run, scheduler timer, and lock lane. Same-or-both-null share a batch.
+
+The lock key (`{model}:{res_id}:{routing_key ?? ""}`) follows the same identity, so concurrent operations on different routing-key lanes for the same record can proceed without serializing on each other.
+
+Filename schema is unchanged (`${model}__${res_id}__${batchKey}.json`); routing_key lives only inside the JSON body. Pre-feature batches on disk that lack `routing_key` load with `routing_key: null` via the legacy normalizer in `store.ts`.
+
 Field roles, all single-purpose:
 
 - **`state`** answers "what phase of the lifecycle is this batch in?" Three values, each with distinct routing in `processBatch`, `recovery`, and `findOpenBatchForRecord`.
+- **`routing_key`** is the optional third identity component. Routes can predicate on it via `{ routingKey: "<glob>" }`. The dispatch layer surfaces it as `$routingKey` in reply args/kwargs and as `routing_key="..."` in the prompt header (skipped when null).
 - **`closedAt`** answers "has this batch ever been dispatched?" Set once on the first `markDispatching` (`queue.ts`'s CAS); never cleared, never re-written. Useful for diagnostics + future readers; no current control-flow path keys off it directly.
 - **`inFlightSince`** answers "if state is dispatching, when did it start?" Used by boot recovery to compute the staleness boundary (`now - inFlightSince < AGENT_RUN_TIMEOUT_MS` → defer; else normalize).
 - **`dispatchAttempts`** / **`deliveryAttempts`** count classified failures (in the JS catch). Caps are enforced in `scheduler.handleFailure` via `nextAction`.

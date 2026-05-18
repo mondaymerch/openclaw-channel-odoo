@@ -11,6 +11,11 @@ export type InboxBatch = {
   state: MessageState;
   model: string;
   res_id: number;
+  /** Optional routing key from the inbound webhook. Together with model+res_id
+   *  this identifies an open batch: messages with different keys on the same
+   *  record produce independent batches (separate debounce + agent runs).
+   *  `null` if the webhook omitted the field. */
+  routing_key: string | null;
   messages: InboundMessage[];
 
   enqueuedAt: Timestamp;     // when the batch was OPENED (first message arrived)

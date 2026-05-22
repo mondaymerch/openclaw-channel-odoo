@@ -38,6 +38,7 @@ function sampleBatch(overrides: Partial<InboxBatch> = {}): InboxBatch {
     state: "received",
     model: "crm.lead",
     res_id: 106665,
+    routing_key: null,
     messages: [
       {
         message_id: 741,
@@ -342,7 +343,7 @@ test("findOpenBatchForRecord: returns the open batch when one exists", async () 
   const { dir, paths } = await makeTempPaths();
   try {
     await writeBatch(paths, sampleBatch({ batchKey: "open-1" }));
-    const hit = await findOpenBatchForRecord(paths, "crm.lead", 106665);
+    const hit = await findOpenBatchForRecord(paths, "crm.lead", 106665, null);
     assert.equal(hit?.batchKey, "open-1");
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -353,7 +354,7 @@ test("findOpenBatchForRecord: null when no batches exist for the record", async 
   const { dir, paths } = await makeTempPaths();
   try {
     await writeBatch(paths, sampleBatch({ batchKey: "elsewhere", model: "sale.order", res_id: 42 }));
-    const hit = await findOpenBatchForRecord(paths, "crm.lead", 106665);
+    const hit = await findOpenBatchForRecord(paths, "crm.lead", 106665, null);
     assert.equal(hit, null);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -372,7 +373,7 @@ test("findOpenBatchForRecord: skips batches in state dispatching", async () => {
         inFlightSince: 12345,
       }),
     );
-    const hit = await findOpenBatchForRecord(paths, "crm.lead", 106665);
+    const hit = await findOpenBatchForRecord(paths, "crm.lead", 106665, null);
     assert.equal(hit, null);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -390,7 +391,7 @@ test("findOpenBatchForRecord: skips batches in state reply_ready", async () => {
         reply: { text: "hi", producedAt: 1000 },
       }),
     );
-    const hit = await findOpenBatchForRecord(paths, "crm.lead", 106665);
+    const hit = await findOpenBatchForRecord(paths, "crm.lead", 106665, null);
     assert.equal(hit, null);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -406,7 +407,7 @@ test("findOpenBatchForRecord: prefix mismatch on res_id is rejected", async () =
       paths,
       sampleBatch({ batchKey: "near-miss", res_id: 1066650 }),
     );
-    const hit = await findOpenBatchForRecord(paths, "crm.lead", 106665);
+    const hit = await findOpenBatchForRecord(paths, "crm.lead", 106665, null);
     assert.equal(hit, null);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -418,7 +419,7 @@ test("findOpenBatchForRecord: null when the only batch for that record lives in 
   try {
     await writeBatch(paths, sampleBatch({ batchKey: "dead-1" }));
     await moveBatchToFailed(paths, "dead-1");
-    const hit = await findOpenBatchForRecord(paths, "crm.lead", 106665);
+    const hit = await findOpenBatchForRecord(paths, "crm.lead", 106665, null);
     assert.equal(hit, null);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -435,7 +436,7 @@ test("findOpenBatchForRecord: tolerates a corrupt file with matching prefix", as
       "{not json",
       "utf8",
     );
-    const hit = await findOpenBatchForRecord(paths, "crm.lead", 106665);
+    const hit = await findOpenBatchForRecord(paths, "crm.lead", 106665, null);
     assert.equal(hit?.batchKey, "good");
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -611,6 +612,50 @@ test("Migration M5: normalizer is idempotent — already-new shape passes throug
     await writeBatch(paths, newShape);
     const b = await readBatch(paths, "new");
     assert.deepEqual(b, newShape);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Migration: pre-routing_key batch JSON loads with routing_key=null (backwards-compat)", async () => {
+  const { dir, paths } = await makeTempPaths();
+  try {
+    // Write a JSON shape lacking the routing_key field — simulates a batch
+    // serialized by a pre-feature version of the plugin.
+    const oldShape = {
+      batchKey: "legacy",
+      state: "received",
+      model: "crm.lead",
+      res_id: 106665,
+      messages: [
+        {
+          message_id: 999,
+          body: "hi",
+          receivedAt: 1000,
+        },
+      ],
+      enqueuedAt: 1000,
+      closedAt: null,
+      inFlightSince: null,
+      dispatchAttempts: 0,
+      deliveryAttempts: 0,
+      lastAttemptAt: null,
+      lastError: null,
+      lastFailureClass: null,
+      reply: null,
+      // intentionally NO routing_key
+    };
+    await writeFile(
+      join(paths.queueDir, "crm.lead__106665__legacy.json"),
+      JSON.stringify(oldShape),
+      "utf8",
+    );
+    const b = await readBatch(paths, "legacy");
+    assert.ok(b);
+    assert.equal(b!.routing_key, null);
+    // Other fields unchanged
+    assert.equal(b!.state, "received");
+    assert.equal(b!.messages.length, 1);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

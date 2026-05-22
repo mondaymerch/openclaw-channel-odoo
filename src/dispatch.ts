@@ -19,7 +19,7 @@ import {
   sanitizeAgentId,
 } from "openclaw/plugin-sdk/routing";
 import {
-  findRouteForModel,
+  findRouteForInbound,
   getClient,
   type CompiledRoute,
   type ResolvedOdooAccount,
@@ -38,6 +38,10 @@ export type InboundMessage = {
   res_id: number;
   body: string;
   message_id: number;
+  /** Optional opaque tag for sub-model routing. Routes can match on this
+   *  with `{ routingKey: "<glob>" }`. Two messages on the same record with
+   *  different routing keys land in independent batches. */
+  routing_key?: string;
   user_name?: string;
   partner_id?: number;
 };
@@ -62,6 +66,7 @@ export type PluginApi = {
 function formatChannelHeader(params: {
   model: string;
   resId: number;
+  routingKey?: string | null;
   userName?: string;
   partnerId?: number;
 }): string {
@@ -70,6 +75,12 @@ function formatChannelHeader(params: {
     `model=${params.model}`,
     `res_id=${params.resId}`,
   ];
+  const trimmedKey =
+    typeof params.routingKey === "string" ? params.routingKey.trim() : "";
+  if (trimmedKey) {
+    const escaped = trimmedKey.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    parts.push(`routing_key="${escaped}"`);
+  }
   const trimmedName = params.userName?.trim();
   if (trimmedName) {
     const escaped = trimmedName.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
@@ -104,6 +115,8 @@ export type CreateDispatchHandlerDeps = {
   scheduler: RetryScheduler;
   /** Hard timeout for the dispatch await. Default: `HARD_TIMEOUT_MS` (15min). */
   hardTimeoutMs?: number;
+  /** Test seam — default `Date.now`. */
+  now?: () => number;
   /**
    * Test seam — default uses `channel.ts`'s real `getClient`. Tests inject
    * a fake to avoid spinning up an XML-RPC client.
@@ -115,6 +128,7 @@ export function createDispatchHandler(deps: CreateDispatchHandlerDeps): Dispatch
   const { api, account, clientConfig, queue, scheduler } = deps;
   const hardTimeoutMs = deps.hardTimeoutMs ?? HARD_TIMEOUT_MS;
   const getOdooClient = deps.getClient ?? getClient;
+  const now = deps.now ?? (() => Date.now());
 
   return {
     async processBatch(batch: InboxBatch): Promise<void> {
@@ -122,17 +136,21 @@ export function createDispatchHandler(deps: CreateDispatchHandlerDeps): Dispatch
         model: batch.model,
         res_id: batch.res_id,
         batchKey: batch.batchKey,
+        routing_key: batch.routing_key,
       };
 
       let matched: CompiledRoute;
       try {
-        matched = findRouteForModel(account.routes, batch.model);
+        matched = findRouteForInbound(account.routes, {
+          model: batch.model,
+          routingKey: batch.routing_key,
+        });
       } catch (err) {
-        // findRouteForModel throws when no route matches AND no catchall
+        // findRouteForInbound throws when no route matches AND no catchall
         // exists. `compileRoutes` adds a catchall at the end, so in
         // production this can't fire — but defensive against misconfig.
         api.logger.error(
-          `[odoo] processBatch: no route for model=${batch.model} batchKey=${batch.batchKey}`,
+          `[odoo] processBatch: no route for model=${batch.model} routingKey=${batch.routing_key ?? ""} batchKey=${batch.batchKey}`,
         );
         await scheduler.handleFailure(ref, "internal_error", err);
         return;
@@ -170,13 +188,30 @@ export function createDispatchHandler(deps: CreateDispatchHandlerDeps): Dispatch
           return;
         }
         case "dispatching": {
-          // Shouldn't reach here — scheduler and boot recovery never
-          // schedule a "dispatching" batch directly (recovery normalizes
-          // stale dispatching to "received" first; live dispatching means
-          // some other caller is already mid-flight). Defensive skip.
-          api.logger.error(
-            `[odoo] processBatch unexpected state=dispatching batchKey=${batch.batchKey} — skipping`,
-          );
+          // Boot recovery schedules fresh in-flight batches at their
+          // staleness boundary. When that timer fires, the batch is still
+          // `dispatching`, so normalize it through the same failure path used
+          // by stale-dispatching boot recovery instead of leaving it stuck.
+          const ageMs =
+            batch.inFlightSince === null
+              ? Number.POSITIVE_INFINITY
+              : now() - batch.inFlightSince;
+          if (ageMs >= hardTimeoutMs) {
+            api.logger.error(
+              `[odoo] processBatch stale state=dispatching batchKey=${batch.batchKey} ` +
+                `ageMs=${ageMs} hardTimeoutMs=${hardTimeoutMs} — retrying via backoff`,
+            );
+            await scheduler.handleFailure(
+              ref,
+              "internal_error",
+              new Error("dispatch hard timeout (stale dispatching marker)"),
+            );
+          } else {
+            api.logger.info(
+              `[odoo] processBatch state=dispatching batchKey=${batch.batchKey} ` +
+                `ageMs=${ageMs} hardTimeoutMs=${hardTimeoutMs} — still in flight`,
+            );
+          }
           return;
         }
         case "received":
@@ -244,6 +279,7 @@ export function createDispatchHandler(deps: CreateDispatchHandlerDeps): Dispatch
           ? `${formatChannelHeader({
               model: batch.model,
               resId: batch.res_id,
+              routingKey: batch.routing_key,
               userName: last.user_name,
               partnerId: last.partner_id,
             })}\n\n${combinedBody}`
@@ -383,6 +419,7 @@ async function postViaCallReply(
     resId: batch.res_id,
     body: text,
     requestMessageId: last.message_id,
+    routingKey: batch.routing_key,
     method: matched.reply.method,
     argNames: matched.reply.args,
     kwargs: matched.reply.kwargs,

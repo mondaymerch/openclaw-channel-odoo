@@ -71,6 +71,19 @@ export function createWebhookHandler(deps: {
     const res_id = Number(raw.res_id);
     const message_id = Number(raw.message_id);
     const body = typeof raw.body === "string" ? raw.body : "";
+    // Accept both `routingKey` (camelCase, our config-side convention) and
+    // `routing_key` (snake_case, matches Odoo's controller style). Empty
+    // strings normalize to undefined so they share the "no key" lane.
+    const routingKeyRaw =
+      typeof raw.routingKey === "string"
+        ? raw.routingKey
+        : typeof raw.routing_key === "string"
+          ? raw.routing_key
+          : undefined;
+    const routing_key =
+      routingKeyRaw !== undefined && routingKeyRaw.trim() !== ""
+        ? routingKeyRaw
+        : undefined;
     const user_name =
       typeof raw.user_name === "string" ? raw.user_name : undefined;
     const partner_id =
@@ -113,6 +126,7 @@ export function createWebhookHandler(deps: {
       res_id,
       message_id,
       body,
+      routing_key,
       user_name,
       partner_id,
     });
@@ -162,6 +176,7 @@ export function createWebhookHandler(deps: {
       res_id,
       body,
       message_id,
+      routing_key,
       user_name,
       partner_id,
     });

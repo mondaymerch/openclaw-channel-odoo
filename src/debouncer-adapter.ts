@@ -29,10 +29,17 @@ export function createDebouncerAdapter(
   return async (items) => {
     if (items.length === 0) return;
     const last = items[items.length - 1];
-    const batch = await findOpenBatchForRecord(paths, last.model, last.res_id);
+    const routingKey = last.routing_key ?? null;
+    const batch = await findOpenBatchForRecord(
+      paths,
+      last.model,
+      last.res_id,
+      routingKey,
+    );
     if (!batch) {
       logger.info(
-        `[odoo] debouncer.onFlush: no open batch for ${last.model},${last.res_id} ` +
+        `[odoo] debouncer.onFlush: no open batch for ${last.model},${last.res_id}` +
+          `${routingKey !== null ? `,${routingKey}` : ""} ` +
           `(${items.length} buffered items — likely already dispatched)`,
       );
       return;

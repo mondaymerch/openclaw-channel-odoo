@@ -35,6 +35,11 @@ import type { InboxBatch, Timestamp } from "./types.js";
  */
 function normalizeLegacyBatch(parsed: unknown): InboxBatch {
   const b = parsed as InboxBatch & { dispatchedAt?: Timestamp | null };
+  // Backfill `routing_key` for batches written before that field existed.
+  // Idempotent: leaves any existing value (incl. an explicit null) alone.
+  if (!("routing_key" in (b as Record<string, unknown>))) {
+    b.routing_key = null;
+  }
   if ("closedAt" in b && b.closedAt !== undefined) {
     return b as InboxBatch; // already current shape
   }
@@ -364,6 +369,7 @@ export async function findOpenBatchForRecord(
   paths: InboxQueuePaths,
   model: string,
   res_id: number,
+  routing_key: string | null,
 ): Promise<InboxBatch | null> {
   const prefix = `${sanitizeModel(model)}__${res_id}__`;
   let names: string[];
@@ -380,7 +386,7 @@ export async function findOpenBatchForRecord(
     try {
       const raw = await readFile(join(paths.queueDir, name), "utf8");
       const batch = normalizeLegacyBatch(JSON.parse(raw));
-      if (batch.state === "received") {
+      if (batch.state === "received" && batch.routing_key === routing_key) {
         return batch;
       }
     } catch {

@@ -107,7 +107,11 @@ const entry: any = defineChannelPluginEntry({
 
     const debouncer = createInboundDebouncer<InboundMessage>({
       debounceMs: account.debounceMs,
-      buildKey: (item) => `${item.model}:${item.res_id}`,
+      // Lane key must match the queue's `(model, res_id, routing_key)` batch
+      // identity so the in-memory debounce window doesn't blur messages
+      // meant for different routing-key lanes.
+      buildKey: (item) =>
+        `${item.model}:${item.res_id}:${item.routing_key ?? ""}`,
       onFlush,
       onError: (err, items) => {
         const key = items[0] ? `${items[0].model}:${items[0].res_id}` : "?";

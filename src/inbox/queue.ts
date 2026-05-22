@@ -45,6 +45,10 @@ export type AppendOrCreateInput = {
   res_id: number;
   message_id: number;
   body: string;
+  /** Optional. Together with model+res_id, identifies the batch lane.
+   *  Two inbounds on the same record with different routing keys form
+   *  separate batches; same-or-both-null share a batch. */
+  routing_key?: string | null;
   user_name?: string;
   partner_id?: number;
 };
@@ -66,13 +70,16 @@ export type MarkDispatchingResult =
   | { ok: false; reason: "missing" | "not_received" };
 
 /**
- * Identifies a specific batch. Carries model + res_id so the facade can
- * compute the per-record lock key without round-tripping to disk first.
+ * Identifies a specific batch. Carries model + res_id + routing_key so the
+ * facade can compute the per-lane lock key without round-tripping to disk
+ * first. `routing_key` is `undefined` on refs constructed before the field
+ * existed (older tests, legacy callers) — treated equivalent to `null`.
  */
 export type BatchRef = {
   model: string;
   res_id: number;
   batchKey: string;
+  routing_key?: string | null;
 };
 
 export type InboxQueue = {
@@ -161,11 +168,17 @@ export function createInboxQueue(deps: CreateInboxQueueDeps): InboxQueue {
   const newBatchKey = deps.newBatchKey ?? (() => randomUUID());
   const now = deps.now ?? (() => Date.now());
 
-  const recordKey = (ref: BatchRef) => `${ref.model}:${ref.res_id}`;
+  const laneKey = (
+    model: string,
+    res_id: number,
+    routing_key: string | null | undefined,
+  ) => `${model}:${res_id}:${routing_key ?? ""}`;
+  const refLaneKey = (ref: BatchRef) =>
+    laneKey(ref.model, ref.res_id, ref.routing_key);
 
   return {
     async appendOrCreateBatch(input) {
-      const recordKey = `${input.model}:${input.res_id}`;
+      const recordKey = laneKey(input.model, input.res_id, input.routing_key);
 
       try {
         return await lock.withLock(recordKey, async () => {
@@ -179,8 +192,14 @@ export function createInboxQueue(deps: CreateInboxQueueDeps): InboxQueue {
             };
           }
 
-          // 2. Find currently-open batch for this record.
-          const open = await findOpenBatchForRecord(paths, input.model, input.res_id);
+          // 2. Find currently-open batch for this record + routing-key lane.
+          const routingKey = input.routing_key ?? null;
+          const open = await findOpenBatchForRecord(
+            paths,
+            input.model,
+            input.res_id,
+            routingKey,
+          );
           const t = now();
           const newMessage: InboundMessage = {
             message_id: input.message_id,
@@ -209,6 +228,7 @@ export function createInboxQueue(deps: CreateInboxQueueDeps): InboxQueue {
             state: "received",
             model: input.model,
             res_id: input.res_id,
+            routing_key: routingKey,
             messages: [newMessage],
             enqueuedAt: t,
             closedAt: null,
@@ -235,7 +255,7 @@ export function createInboxQueue(deps: CreateInboxQueueDeps): InboxQueue {
     },
 
     async markDispatching(ref) {
-      return lock.withLock(recordKey(ref), async () => {
+      return lock.withLock(refLaneKey(ref), async () => {
         // CAS: read first to check the precondition, write only if the
         // batch is in state "received". The lock serializes this entire
         // read-check-write sequence.
@@ -260,7 +280,7 @@ export function createInboxQueue(deps: CreateInboxQueueDeps): InboxQueue {
 
     async transitionToReplyReady(ref, text) {
       const t = now();
-      return lock.withLock(recordKey(ref), () =>
+      return lock.withLock(refLaneKey(ref), () =>
         mutateBatch(paths, ref.batchKey, (b) => {
           b.state = "reply_ready";
           b.reply = { text, producedAt: t };
@@ -270,7 +290,7 @@ export function createInboxQueue(deps: CreateInboxQueueDeps): InboxQueue {
     },
 
     async recordDeliverySuccess(ref) {
-      await lock.withLock(recordKey(ref), () =>
+      await lock.withLock(refLaneKey(ref), () =>
         unlinkBatch(paths, ref.batchKey),
       );
     },
@@ -278,7 +298,7 @@ export function createInboxQueue(deps: CreateInboxQueueDeps): InboxQueue {
     async recordFailure(ref, failureClass, error) {
       const t = now();
       const message = formatError(error);
-      return lock.withLock(recordKey(ref), () =>
+      return lock.withLock(refLaneKey(ref), () =>
         mutateBatch(paths, ref.batchKey, (b) => {
           b.lastFailureClass = failureClass;
           b.lastError = message;
@@ -303,7 +323,7 @@ export function createInboxQueue(deps: CreateInboxQueueDeps): InboxQueue {
     },
 
     async moveBatchToFailed(ref) {
-      await lock.withLock(recordKey(ref), () =>
+      await lock.withLock(refLaneKey(ref), () =>
         storeMoveBatchToFailed(paths, ref.batchKey),
       );
     },

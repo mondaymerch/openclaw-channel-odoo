@@ -22,6 +22,9 @@ export interface CallReplyParams {
   resId: number;
   body: string;
   requestMessageId: number;
+  /** Optional routing key from the inbound webhook. Available as
+   *  `$routingKey` in route reply args/kwargs. */
+  routingKey?: string | null;
   method: string;
   argNames: string[];
   kwargs?: Record<string, KwargValue>;
@@ -82,7 +85,8 @@ export class OdooClient {
    * argMap). kwargs entries are resolved per KwargValue (ref → argMap lookup,
    * literal → passed through as-is).
    *
-   * Available variable names: body, requestMessageId, model, resId
+   * Available variable names: body, requestMessageId, model, resId, routingKey
+   * (routingKey is `null` when the inbound webhook didn't supply one).
    */
   async callReply(params: CallReplyParams): Promise<any> {
     const { model, resId, method, argNames } = params;
@@ -91,6 +95,7 @@ export class OdooClient {
       requestMessageId: params.requestMessageId,
       model: params.model,
       resId: params.resId,
+      routingKey: params.routingKey ?? null,
     };
 
     const resolveVar = (name: string): any => {

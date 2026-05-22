@@ -85,6 +85,7 @@ export async function runBootRecovery(
       model: batch.model,
       res_id: batch.res_id,
       batchKey: batch.batchKey,
+      routing_key: batch.routing_key,
     };
 
     // 1. Expire any non-reply_ready batch older than 1h. Covers both

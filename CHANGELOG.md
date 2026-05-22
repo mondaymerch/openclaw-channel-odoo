@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.4.1-beta.1] — 2026-05-22
+
 ### Added
 
 - **Routing-key route matching.** Inbound webhooks may carry an optional `routingKey` (or `routing_key`) field; routes can match on it with `{ routingKey: "<glob>" }` or combined `{ model: "<glob>", routingKey: "<glob>" }` (AND-semantics). Same `*` glob syntax as model matches. Existing model-only routes and Odoo controllers continue to work unchanged.

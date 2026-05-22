@@ -112,6 +112,7 @@ async function makeDispatchHarness(opts: {
   callReply?: (p: CallReplyParams) => Promise<unknown>;
   /** Override markDispatching to test the CAS loser branch in processBatch. */
   markDispatchingOverride?: (ref: BatchRef) => Promise<MarkDispatchingResult>;
+  getRuntime?: CreateDispatchHandlerDeps["getRuntime"];
   hardTimeoutMs?: number;
   now?: () => number;
 } = {}) {
@@ -166,6 +167,7 @@ async function makeDispatchHarness(opts: {
     hardTimeoutMs: opts.hardTimeoutMs,
     now: opts.now,
     getClient: () => ({ callReply: wrappedCallReply }),
+    getRuntime: opts.getRuntime,
   };
 
   const handler = createDispatchHandler(deps);
@@ -389,6 +391,111 @@ test("E1-T5: markDispatching returns missing → no agent, no callReply, no hand
       (m) => m.includes("skipping dispatch") && m.includes("missing"),
     );
     assert.ok(skipLog);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ============================================================
+// E1-T5b: received branch forces automatic delivery for Odoo XML-RPC
+// ============================================================
+
+test("E1-T5b: received branch uses automatic source delivery and posts final reply", async () => {
+  const dispatchCalls: Array<{
+    replyOptions?: { sourceReplyDeliveryMode?: string };
+    bodyForAgent?: string;
+  }> = [];
+
+  const { dir, paths, fakeTimers, handler, callReplyCalls } =
+    await makeDispatchHarness({
+      routes: [
+        makeRoute("purchase.order", {
+          match: {
+            kind: "model",
+            regex: /^purchase\.order$/,
+            pattern: "purchase.order",
+          },
+          agentId: "purchase-scheduled-date",
+          reply: {
+            method: "scheduled_date_response",
+            args: ["body", "requestMessageId"],
+            kwargs: {},
+          },
+        } as Partial<CompiledRoute>),
+      ],
+      getRuntime: () => ({
+        channel: {
+          routing: {
+            resolveAgentRoute: () => ({
+              agentId: "public",
+              sessionKey: "agent:public:odoo:direct:purchase.order:39269",
+              mainSessionKey: "agent:public",
+            }),
+          },
+          reply: {
+            finalizeInboundContext: (ctx: { BodyForAgent?: string }) => ctx,
+            dispatchReplyWithBufferedBlockDispatcher: async (params: {
+              ctx: { BodyForAgent?: string };
+              dispatcherOptions: {
+                deliver: (payload: { text?: string }) => Promise<void>;
+              };
+              replyOptions?: { sourceReplyDeliveryMode?: string };
+            }) => {
+              dispatchCalls.push({
+                replyOptions: params.replyOptions,
+                bodyForAgent: params.ctx.BodyForAgent,
+              });
+              await params.dispatcherOptions.deliver({
+                text: "{\"is_scheduled_date_response\":true,\"scheduled_date\":\"2026-06-18\"}",
+              });
+              return { queuedFinal: true, counts: { final: 1, block: 0, tool: 0 } };
+            },
+          },
+          session: {
+            resolveStorePath: () => "/tmp/openclaw-test-store",
+            recordInboundSession: async () => undefined,
+          },
+        },
+      } as unknown as ReturnType<NonNullable<CreateDispatchHandlerDeps["getRuntime"]>>),
+    });
+  try {
+    const batch: InboxBatch = {
+      batchKey: "abc",
+      state: "received",
+      model: "purchase.order",
+      res_id: 39269,
+      routing_key: "purchase.receipt.scheduled_date_response",
+      messages: [
+        {
+          message_id: 3569,
+          body: "Latest message body: delivery arrives 2026-06-18",
+          user_name: "Raven Automation",
+          partner_id: 249604,
+          receivedAt: 1000,
+        },
+      ],
+      enqueuedAt: 1000,
+      closedAt: null,
+      inFlightSince: null,
+      dispatchAttempts: 0,
+      deliveryAttempts: 0,
+      lastAttemptAt: null,
+      lastError: null,
+      lastFailureClass: null,
+      reply: null,
+    };
+    await writeBatch(paths, batch);
+
+    await handler.processBatch(batch);
+
+    assert.equal(dispatchCalls.length, 1);
+    assert.equal(dispatchCalls[0].replyOptions?.sourceReplyDeliveryMode, "automatic");
+    assert.ok(dispatchCalls[0].bodyForAgent?.includes("routing_key="));
+    assert.equal(callReplyCalls.length, 1);
+    assert.equal(callReplyCalls[0].method, "scheduled_date_response");
+    assert.equal(callReplyCalls[0].requestMessageId, 3569);
+    assert.equal(await readBatch(paths, "abc"), null);
+    assert.equal(fakeTimers.pending.length, 0);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

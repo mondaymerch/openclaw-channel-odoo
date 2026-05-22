@@ -122,6 +122,10 @@ export type CreateDispatchHandlerDeps = {
    * a fake to avoid spinning up an XML-RPC client.
    */
   getClient?: (cfg: OdooConfig) => { callReply: (p: CallReplyParams) => Promise<unknown> };
+  /**
+   * Test seam — default uses `runtime.ts`'s real runtime store.
+   */
+  getRuntime?: () => ReturnType<typeof getOdooRuntime>;
 };
 
 export function createDispatchHandler(deps: CreateDispatchHandlerDeps): DispatchHandler {
@@ -240,7 +244,7 @@ export function createDispatchHandler(deps: CreateDispatchHandlerDeps): Dispatch
       let deliverOutcome: "success" | "xmlrpc_failure" | null = null;
 
       try {
-        const rt = getOdooRuntime();
+        const rt = (deps.getRuntime ?? getOdooRuntime)();
         const cfg = api.config;
         const last = batch.messages[batch.messages.length - 1];
         const peerId = `${batch.model}:${batch.res_id}`;
@@ -330,6 +334,12 @@ export function createDispatchHandler(deps: CreateDispatchHandlerDeps): Dispatch
         });
 
         // --- Race: openclaw dispatch vs hard timeout
+        const automaticReplyOptions = {
+          sourceReplyDeliveryMode: "automatic",
+        } as unknown as NonNullable<
+          Parameters<typeof rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher>[0]["replyOptions"]
+        >;
+
         const dispatchPromise = rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
           ctx,
           cfg,
@@ -364,6 +374,7 @@ export function createDispatchHandler(deps: CreateDispatchHandlerDeps): Dispatch
               api.logger.error(`[odoo] Reply dispatch error: ${err}`);
             },
           },
+          replyOptions: automaticReplyOptions,
         });
 
         const result = await Promise.race<{ kind: "resolved" } | { kind: "timeout" }>([

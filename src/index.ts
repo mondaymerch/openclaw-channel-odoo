@@ -38,6 +38,22 @@ import { createWebhookHandler } from "./webhook-handler.js";
 const DEDUPE_TTL_MS = 2 * 60 * 1000;
 const DEDUPE_MAX_SIZE = 10_000;
 
+const startedChannelSideEffects = new Set<string>();
+
+function channelSideEffectsKey(account: ReturnType<typeof resolveAccount>): string {
+  return [
+    account.accountId ?? "default",
+    account.url,
+    account.db,
+    account.uid,
+    account.webhookPath,
+  ].join("\0");
+}
+
+export function resetOdooChannelSideEffectsForTests(): void {
+  startedChannelSideEffects.clear();
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const entry: any = defineChannelPluginEntry({
   id: CHANNEL_ID,
@@ -59,6 +75,15 @@ const entry: any = defineChannelPluginEntry({
       createOdooSearchReadTool(api.config),
       { name: "odoo_search_read" },
     );
+
+    const sideEffectsKey = channelSideEffectsKey(account);
+    if (startedChannelSideEffects.has(sideEffectsKey)) {
+      api.logger.debug?.(
+        `[odoo] Channel side effects already active for ${account.webhookPath}; skipping duplicate recovery`,
+      );
+      return;
+    }
+    startedChannelSideEffects.add(sideEffectsKey);
 
     const dedupe = createDedupeCache({
       ttlMs: DEDUPE_TTL_MS,

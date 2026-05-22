@@ -183,7 +183,17 @@ function compileReply(raw: unknown, routePath: string): CompiledReply {
 function compileMatch(raw: unknown, routePath: string): RouteMatch {
   if (raw === "*") return { kind: "catchall" };
   if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
-    const { model, routingKey } = raw as Record<string, unknown>;
+    const obj = raw as Record<string, unknown>;
+    const allowedKeys = new Set(["model", "routingKey"]);
+    for (const key of Object.keys(obj)) {
+      if (!allowedKeys.has(key)) {
+        const hint =
+          key === "routing_key" ? " (config uses camelCase: routingKey)" : "";
+        throw new Error(`odoo: ${routePath}.match.${key}: unknown key${hint}`);
+      }
+    }
+
+    const { model, routingKey } = obj;
     const hasModel = model !== undefined;
     const hasRoutingKey = routingKey !== undefined;
     if (!hasModel && !hasRoutingKey) {

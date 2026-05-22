@@ -115,6 +115,8 @@ export type CreateDispatchHandlerDeps = {
   scheduler: RetryScheduler;
   /** Hard timeout for the dispatch await. Default: `HARD_TIMEOUT_MS` (15min). */
   hardTimeoutMs?: number;
+  /** Test seam — default `Date.now`. */
+  now?: () => number;
   /**
    * Test seam — default uses `channel.ts`'s real `getClient`. Tests inject
    * a fake to avoid spinning up an XML-RPC client.
@@ -126,6 +128,7 @@ export function createDispatchHandler(deps: CreateDispatchHandlerDeps): Dispatch
   const { api, account, clientConfig, queue, scheduler } = deps;
   const hardTimeoutMs = deps.hardTimeoutMs ?? HARD_TIMEOUT_MS;
   const getOdooClient = deps.getClient ?? getClient;
+  const now = deps.now ?? (() => Date.now());
 
   return {
     async processBatch(batch: InboxBatch): Promise<void> {
@@ -185,13 +188,30 @@ export function createDispatchHandler(deps: CreateDispatchHandlerDeps): Dispatch
           return;
         }
         case "dispatching": {
-          // Shouldn't reach here — scheduler and boot recovery never
-          // schedule a "dispatching" batch directly (recovery normalizes
-          // stale dispatching to "received" first; live dispatching means
-          // some other caller is already mid-flight). Defensive skip.
-          api.logger.error(
-            `[odoo] processBatch unexpected state=dispatching batchKey=${batch.batchKey} — skipping`,
-          );
+          // Boot recovery schedules fresh in-flight batches at their
+          // staleness boundary. When that timer fires, the batch is still
+          // `dispatching`, so normalize it through the same failure path used
+          // by stale-dispatching boot recovery instead of leaving it stuck.
+          const ageMs =
+            batch.inFlightSince === null
+              ? Number.POSITIVE_INFINITY
+              : now() - batch.inFlightSince;
+          if (ageMs >= hardTimeoutMs) {
+            api.logger.error(
+              `[odoo] processBatch stale state=dispatching batchKey=${batch.batchKey} ` +
+                `ageMs=${ageMs} hardTimeoutMs=${hardTimeoutMs} — retrying via backoff`,
+            );
+            await scheduler.handleFailure(
+              ref,
+              "internal_error",
+              new Error("dispatch hard timeout (stale dispatching marker)"),
+            );
+          } else {
+            api.logger.info(
+              `[odoo] processBatch state=dispatching batchKey=${batch.batchKey} ` +
+                `ageMs=${ageMs} hardTimeoutMs=${hardTimeoutMs} — still in flight`,
+            );
+          }
           return;
         }
         case "received":

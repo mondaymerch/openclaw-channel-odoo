@@ -166,6 +166,14 @@ test("compileMatch: non-string routingKey is rejected", () => {
   assert.throws(() => resolveAccount(cfg), /routingKey: required non-empty string/);
 });
 
+test("compileMatch: snake_case routing_key in config is rejected instead of ignored", () => {
+  const cfg = buildCfg(withMatches([{ model: "crm.lead", routing_key: "urgent" }]));
+  assert.throws(
+    () => resolveAccount(cfg),
+    /match\.routing_key: unknown key \(config uses camelCase: routingKey\)/,
+  );
+});
+
 // ===========================================================================
 // findRouteForInbound — resolution semantics
 // ===========================================================================

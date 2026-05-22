@@ -201,9 +201,9 @@ The agent already produced text on a prior attempt; we just need to deliver it a
    - `{ kind: "resolved" }` with `deliverOutcome` set → success or xmlrpc_failure already classified by deliver wrapper.
 6. **Outer catch**: any thrown error (route resolution, session record, unexpected agent runtime error) → `handleFailure(internal_error)`.
 
-### Branch 3: `dispatching` (defensive)
+### Branch 3: `dispatching`
 
-Reached only via boot recovery's deferred-fresh-dispatching path (when the staleness-boundary timer fires). The defensive branch logs an error and returns without action — a known gap: see "Known limitations" below.
+Reached via boot recovery's deferred-fresh-dispatching path. If the batch is still fresh (`now - inFlightSince < HARD_TIMEOUT_MS`), `processBatch` treats it as still in flight and returns. If it has reached the hard-timeout boundary, it calls `scheduler.handleFailure(ref, "internal_error", ...)`, which flips the batch back to `received`, bumps `dispatchAttempts`, clears `inFlightSince`, and schedules the normal dispatch backoff retry.
 
 ### Branch 4 (default, never)
 
@@ -248,7 +248,7 @@ Partition pass (single iteration over `listBatches(paths)`):
 1. **Expire** — `state !== "reply_ready" && now - enqueuedAt > REPLAY_TTL_MS` (1 h) → `moveBatchToFailed`, bump `summary.expired`.
 2. **eligibleReplyReady** — `state === "reply_ready"` → `scheduleAt(batch, 0)`. No stagger, no backoff respect, no TTL. Faster delivery is strictly better than letting a typed reply rot.
 3. **dispatching** — split by `inFlightSince` freshness:
-   - Fresh (`now - inFlightSince < agentTimeoutMs`) → `scheduleAt(batch, inFlightSince + agentTimeoutMs - now)`, bump `summary.deferred`. The previous process is presumed still running this dispatch; wait for the staleness boundary.
+   - Fresh (`now - inFlightSince < agentTimeoutMs`) → `scheduleAt(batch, inFlightSince + agentTimeoutMs - now)`, bump `summary.deferred`. The previous process is presumed still running this dispatch; wait for the staleness boundary. When the timer fires, `processBatch` re-checks freshness and normalizes to the normal retry/backoff path if the batch is stale.
    - Stale → call `queue.recordFailure(ref, "internal_error", "stale dispatching marker")` synchronously. This flips state back to `received`, bumps `dispatchAttempts`, clears `inFlightSince`, sets `lastAttemptAt = now()`. Then falls through to the received-path logic below. The counter bump gives gateway-flapping a real bound (`DISPATCH_MAX_ATTEMPTS = 3`).
 4. **received** — split by next-eligible-at:
    - `lastAttemptAt + backoff[counter - 1] > now` → `scheduleAt(batch, residual)`, bump `summary.notYetEligibleReceived`.
@@ -328,7 +328,6 @@ Other plugin constants in `index.ts`:
 These are documented; some may be addressed in follow-up work.
 
 - **Hard-timeout late-deliver double-post.** If the agent hangs past `HARD_TIMEOUT_MS` AND the original dispatch promise eventually invokes its `deliver` AFTER the retry's `markDispatching` succeeded, both attempts can call `postViaCallReply` — up to 2 XML-RPC posts to the same Odoo record. The CAS prevents double agent runs but `transitionToReplyReady` has no per-attempt identity check. Bounded by `DISPATCH_MAX_ATTEMPTS`. Idempotency-key plumbing (server-side dedup keyed on `requestMessageId`) would close this end-to-end.
-- **Deferred fresh-`dispatching` batch can get stuck.** When the staleness-boundary timer fires for a batch in `state: "dispatching"`, `processBatch` hits the defensive `case "dispatching"` branch and returns without action. The batch sits in `dispatching` state until TTL expires (1 h). Easy follow-up: have that branch call `scheduler.handleFailure(ref, "internal_error", ...)` to normalize, same as recovery's stale path does at boot.
 - **Per-record serialization depends on openclaw's `queueMode`.** When a webhook arrives while the existing batch is in `dispatching` or `reply_ready`, our `findOpenBatchForRecord` returns no open batch and a parallel batch is created with a different `batchKey` for the same `(model, res_id)`. Both batches eventually call `dispatchReplyWithBufferedBlockDispatcher` with the same `sessionKey`. Under the default `queueMode === "collect"` (and `"followup"`, `"steer-backlog"`), openclaw's reply-run registry chains the second dispatch as a follow-up run that fires after the first completes — two ordered agent replies on the same Odoo thread, no synthetic-error reply. If `queueMode` is changed to a non-chaining mode (e.g. `"interrupt"`), the second batch instead hits `ReplyRunAlreadyActiveError` and posts a synthetic "previous run shutting down" reply to chatter. See the "Per-record serialization" subsection under Concurrency model.
 - **`reply_ready` ignores backoff on restart.** Boot recovery fires `scheduleAt(batch, 0)` for any `reply_ready` regardless of `lastAttemptAt`. A permanently broken Odoo endpoint with frequent gateway restarts can produce self-spamming until `deliveryAttempts` cap is hit.
 - **`reply_ready` never expires by TTL.** The TTL gate is `state !== "reply_ready"`. A permanently un-deliverable reply sits on disk until `deliveryAttempts` cap is hit through live retries.
@@ -350,7 +349,7 @@ These are documented; some may be addressed in follow-up work.
 | `queue.test.ts` | 33 | Facade methods, dedup, CAS rejection, recordFailure state-flip, full lifecycle |
 | `scheduler.test.ts` | 20 | Backoff progression, cap enforcement, timer cancel/replace, re-read-before-fire |
 | `recovery.test.ts` | 17 | All six partition buckets, stale-dispatching normalize, legacy-shape integration |
-| `dispatch.test.ts` | 6 | reply_ready branch, CAS loser path, defensive dispatching skip, no-route handling |
+| `dispatch.test.ts` | 7 | reply_ready branch, CAS loser path, dispatching freshness/staleness handling, no-route handling |
 | `webhook-handler.test.ts` | 6 | Persist-before-ACK outcomes, ready-gate, in-memory dedup short-circuit |
 | `debouncer-adapter.test.ts` | 3 | Open batch lookup, no-batch-found skip, multi-item buffer |
 

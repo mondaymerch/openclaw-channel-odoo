@@ -685,6 +685,7 @@ Config is validated at startup. All errors are fail-fast with a path pointing at
 | `odoo: routes[N].match: must be "*", { model: "<glob>" }, { routingKey: "<glob>" }, or { model, routingKey }` | Invalid match shape | Check syntax |
 | `odoo: routes[N].match: object must include "model" and/or "routingKey"` | Empty `{}` match | Add at least one of `model` / `routingKey` |
 | `odoo: routes[N].match.routingKey: required non-empty string` | `routingKey` is empty or wrong type | Provide a non-empty string |
+| `odoo: routes[N].match.routing_key: unknown key (config uses camelCase: routingKey)` | Used payload-style snake_case in route config | Rename to `routingKey` |
 | `odoo: routes[N].reply.method: required non-empty string` | Missing/empty method name | Fix the method field |
 | `odoo: routes[N].reply.args[M]: unknown variable "<name>"` | Typo in a variable ref | Must be one of `body`, `requestMessageId`, `model`, `resId`, `routingKey` |
 | `odoo: routes[N].reply.kwargs.<key>: unknown variable "$<name>"` | Typo in a `$`-prefixed kwarg ref | Same allowlist as above. If you wanted a literal `$foo`, escape with `$$foo` |

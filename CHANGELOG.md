@@ -20,6 +20,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - `debounceMs` accepts integers in `[0, 60000]`.
   - `agentTimeoutMs` accepts integers in `[30000, REPLAY_TTL_MS]` (i.e. ≤ 1 h). Values above that would let the on-disk TTL fire before the in-process timeout, leaving the batch in `dispatching` until the next boot's recovery sweep — rejected at startup with a clear error.
 
+### Fixed
+
+- **Deferred in-flight recovery no longer leaves batches stuck in `dispatching`.** When boot recovery defers a fresh in-flight batch until its hard-timeout boundary, the scheduled retry now normalizes the stale marker through `scheduler.handleFailure(..., "internal_error", ...)`, preserving the normal dispatch backoff/cap behavior instead of waiting for TTL.
+
 ## [0.4.0] — 2026-05-15
 
 Promotes [0.4.0-beta](#040-beta--2026-05-13) to the stable `latest` dist-tag. `npm install openclaw-channel-odoo` now resolves to 0.4.0; existing 0.3.1 installs are unaffected until they upgrade.

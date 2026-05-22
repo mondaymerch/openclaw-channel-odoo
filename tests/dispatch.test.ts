@@ -40,6 +40,7 @@ import {
 } from "../src/inbox/store.js";
 import {
   DELIVERY_BACKOFF_MS,
+  DISPATCH_BACKOFF_MS,
   type InboxBatch,
 } from "../src/inbox/types.js";
 
@@ -111,6 +112,8 @@ async function makeDispatchHarness(opts: {
   callReply?: (p: CallReplyParams) => Promise<unknown>;
   /** Override markDispatching to test the CAS loser branch in processBatch. */
   markDispatchingOverride?: (ref: BatchRef) => Promise<MarkDispatchingResult>;
+  hardTimeoutMs?: number;
+  now?: () => number;
 } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "odoo-dispatch-handler-"));
   const paths = resolveInboxQueuePaths(dir);
@@ -160,6 +163,8 @@ async function makeDispatchHarness(opts: {
     clientConfig,
     queue,
     scheduler,
+    hardTimeoutMs: opts.hardTimeoutMs,
+    now: opts.now,
     getClient: () => ({ callReply: wrappedCallReply }),
   };
 
@@ -191,6 +196,7 @@ const refOf = (batch: InboxBatch): BatchRef => ({
   model: batch.model,
   res_id: batch.res_id,
   batchKey: batch.batchKey,
+  routing_key: batch.routing_key,
 });
 
 // ============================================================
@@ -389,12 +395,12 @@ test("E1-T5: markDispatching returns missing → no agent, no callReply, no hand
 });
 
 // ============================================================
-// E1-T6: defensive state="dispatching" branch → no-op
+// E1-T6: fresh state="dispatching" branch → still in-flight no-op
 // ============================================================
 
-test("E1-T6: state=dispatching reaching processBatch → defensive skip, no side effects", async () => {
+test("E1-T6: fresh state=dispatching reaching processBatch → no side effects", async () => {
   const { dir, paths, fakeTimers, handler, logger, callReplyCalls } =
-    await makeDispatchHarness();
+    await makeDispatchHarness({ now: () => 2_000, hardTimeoutMs: 900_000 });
   try {
     const batch: InboxBatch = {
       batchKey: "abc",
@@ -425,10 +431,60 @@ test("E1-T6: state=dispatching reaching processBatch → defensive skip, no side
     const after = await readBatch(paths, "abc");
     assert.deepEqual(after, snapshot);
 
-    const skipLog = logger.errors.find((m) =>
-      m.includes("unexpected state=dispatching"),
+    const skipLog = logger.infos.find((m) =>
+      m.includes("state=dispatching") && m.includes("still in flight"),
     );
     assert.ok(skipLog);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ============================================================
+// E1-T7: stale state="dispatching" branch → failure/backoff retry
+// ============================================================
+
+test("E1-T7: stale state=dispatching reaching processBatch → normalized and retry scheduled", async () => {
+  const { dir, paths, fakeTimers, handler, logger, callReplyCalls } =
+    await makeDispatchHarness({ now: () => 20_000, hardTimeoutMs: 10_000 });
+  try {
+    const batch: InboxBatch = {
+      batchKey: "abc",
+      state: "dispatching",
+      model: "crm.lead",
+      res_id: 106665,
+      messages: [{ message_id: 1, body: "hi", receivedAt: 1000 }],
+      enqueuedAt: 1000,
+      closedAt: 1500,
+      inFlightSince: 1500,
+      dispatchAttempts: 0,
+      deliveryAttempts: 0,
+      lastAttemptAt: null,
+      lastError: null,
+      lastFailureClass: null,
+      reply: null,
+    };
+    await writeBatch(paths, batch);
+
+    await handler.processBatch(batch);
+
+    assert.equal(callReplyCalls.length, 0);
+
+    const after = await readBatch(paths, "abc");
+    assert.ok(after);
+    assert.equal(after!.state, "received");
+    assert.equal(after!.inFlightSince, null);
+    assert.equal(after!.dispatchAttempts, 1);
+    assert.equal(after!.lastFailureClass, "internal_error");
+    assert.ok(after!.lastError?.includes("stale dispatching"));
+
+    assert.equal(fakeTimers.pending.length, 1);
+    assert.equal(fakeTimers.pending[0].delayMs, DISPATCH_BACKOFF_MS[0]);
+
+    const staleLog = logger.errors.find((m) =>
+      m.includes("stale state=dispatching") && m.includes("retrying via backoff"),
+    );
+    assert.ok(staleLog);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

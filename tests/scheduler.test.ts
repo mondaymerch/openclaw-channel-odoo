@@ -16,6 +16,7 @@ import {
   createRetryScheduler,
   type ProcessBatchFn,
 } from "../src/inbox/scheduler.js";
+import type { AdmissionController } from "../src/inbox/admission.js";
 import {
   ensureInboxQueueDirs,
   mutateBatch,
@@ -72,6 +73,7 @@ function makeLogger() {
 async function makeSchedulerHarness(opts: {
   keys?: string[];
   processBatch?: ProcessBatchFn;
+  admission?: AdmissionController;
 } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "odoo-inbox-sched-"));
   const paths = resolveInboxQueuePaths(dir);
@@ -96,6 +98,7 @@ async function makeSchedulerHarness(opts: {
     paths,
     queue,
     processBatch,
+    admission: opts.admission,
     logger: logger.logger,
     setTimer: timers.setTimer,
     clearTimer: timers.clearTimer,
@@ -376,6 +379,38 @@ test("S3: scheduleAt for the same batchKey twice cancels the first timer", async
     scheduler.scheduleAt(batch, 500);
     assert.equal(timers.pending.length, 1, "old timer cancelled, only one remains");
     assert.equal(timers.pending[0].delayMs, 500);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("S4: admission denial defers without recording a failure attempt", async () => {
+  const { dir, paths, queue, scheduler, timers, processed, logger } =
+    await makeSchedulerHarness({
+      keys: ["abc"],
+      admission: {
+        tryAcquire: () => ({ ok: false, reason: "busy", retryMs: 12_345 }),
+        snapshot: () => ({
+          activeDispatches: 1,
+          maxConcurrentDispatches: 1,
+          lastDispatchStartedAt: 0,
+        }),
+      },
+    });
+  try {
+    await queue.appendOrCreateBatch(enqueueInput(100));
+    const batch = await readBatch(paths, "abc");
+    assert.ok(batch);
+
+    scheduler.scheduleAt(batch, 0);
+    await timers.flushAll();
+
+    assert.equal(processed.length, 0);
+    assert.equal(timers.pending.length, 1);
+    assert.equal(timers.pending[0].delayMs, 12_345);
+    const current = await readBatch(paths, "abc");
+    assert.equal(current?.dispatchAttempts, 0);
+    assert.ok(logger.infos.some((m) => m.includes("inbox.admission deferred")));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

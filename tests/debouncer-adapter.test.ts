@@ -2,9 +2,8 @@
  * Tests for src/debouncer-adapter.ts — createDebouncerAdapter.
  *
  * The adapter sits between the in-memory debouncer (which buffers
- * InboundMessage objects) and processBatch (which expects a persisted
- * InboxBatch). On flush it looks up the open batch on disk and hands it
- * to processBatch.
+ * InboundMessage objects) and the inbox scheduler. On flush it looks up the
+ * open batch on disk and schedules it for controlled drain.
  *
  * Run: npx tsx --test tests/debouncer-adapter.test.ts
  */
@@ -65,10 +64,10 @@ async function setup() {
 }
 
 // ============================================================
-// E3-T1: open batch on disk → processBatch called with it
+// E3-T1: open batch on disk → scheduleBatch called with it
 // ============================================================
 
-test("E3-T1: open batch on disk → processBatch called with the batch", async () => {
+test("E3-T1: open batch on disk → scheduleBatch called with the batch", async () => {
   const { dir, paths } = await setup();
   try {
     const batch = makeBatch({ batchKey: "abc" });
@@ -78,7 +77,7 @@ test("E3-T1: open batch on disk → processBatch called with the batch", async (
     const { logger } = makeLogger();
     const adapter = createDebouncerAdapter({
       paths,
-      processBatch: async (b) => {
+      scheduleBatch: async (b) => {
         calls.push(b);
       },
       logger,
@@ -102,14 +101,14 @@ test("E3-T1: open batch on disk → processBatch called with the batch", async (
 // E3-T2: no batch on disk → adapter logs + no-op
 // ============================================================
 
-test("E3-T2: no batch on disk → adapter logs and skips processBatch", async () => {
+test("E3-T2: no batch on disk → adapter logs and skips scheduleBatch", async () => {
   const { dir, paths } = await setup();
   try {
     const calls: InboxBatch[] = [];
     const { logger, infos } = makeLogger();
     const adapter = createDebouncerAdapter({
       paths,
-      processBatch: async (b) => {
+      scheduleBatch: async (b) => {
         calls.push(b);
       },
       logger,
@@ -132,7 +131,7 @@ test("E3-T2: no batch on disk → adapter logs and skips processBatch", async ()
 // E3-T3: multi-item buffer derives (model, res_id) from last item
 // ============================================================
 
-test("E3-T3: multi-item buffer looks up once, processBatch called once", async () => {
+test("E3-T3: multi-item buffer looks up once, scheduleBatch called once", async () => {
   const { dir, paths } = await setup();
   try {
     const batch = makeBatch({
@@ -148,7 +147,7 @@ test("E3-T3: multi-item buffer looks up once, processBatch called once", async (
     const { logger } = makeLogger();
     const adapter = createDebouncerAdapter({
       paths,
-      processBatch: async (b) => {
+      scheduleBatch: async (b) => {
         calls.push(b);
       },
       logger,

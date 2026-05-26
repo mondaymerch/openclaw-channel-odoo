@@ -264,6 +264,31 @@ When a message has a routing key:
 
 When a message has no routing key, the batch's `routing_key` is `null`. Routes that gate on `routingKey` simply don't match; they fall through to `model`-only routes or the catchall.
 
+### Inbox backpressure
+
+Inbound webhooks are persisted before the plugin returns `202`, then drained
+through the inbox scheduler. These optional knobs keep Odoo bursts queued
+instead of starting too many OpenClaw runs in the same process:
+
+```jsonc
+{
+  "channels": {
+    "odoo": {
+      "maxConcurrentDispatches": 1,
+      "minDispatchSpacingMs": 5000,
+      "dispatchAdmissionRetryMs": 15000,
+      "maxProcessRssMb": 0,
+      "maxEventLoopDelayMs": 0
+    }
+  }
+}
+```
+
+- `maxConcurrentDispatches` defaults to `1`; increase only if the VM has spare CPU/memory.
+- `minDispatchSpacingMs` defaults to `5000`; this smooths chatter bursts.
+- `dispatchAdmissionRetryMs` defaults to `15000`; deferred batches retry without consuming failure attempts.
+- `maxProcessRssMb` and `maxEventLoopDelayMs` default to `0` (disabled). Set them to pause Odoo draining when the OpenClaw process is already under pressure.
+
 ### Rules
 
 - `routes` is required and non-empty

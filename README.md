@@ -50,8 +50,23 @@ Minimal `openclaw.json`:
       //   agentTimeoutMs: hard cap on one dispatch attempt (agent run +
       //                   delivery). Also the staleness boundary used by
       //                   boot recovery. Range [30000, 3600000].
+      //   maxConcurrentDispatches:
+      //                   max Odoo inbox batches allowed to dispatch at once.
+      //                   Default 1 so Odoo bursts queue instead of starting
+      //                   many agent runs in the OpenClaw process.
+      //   minDispatchSpacingMs:
+      //                   min spacing between dispatch starts. Default 5000.
+      //   dispatchAdmissionRetryMs:
+      //                   retry delay when the admission gate defers a batch.
+      //                   Default 15000.
+      //   maxProcessRssMb / maxEventLoopDelayMs:
+      //                   optional process-health admission limits. Default 0
+      //                   disables each check.
       "debounceMs": 3000,
       "agentTimeoutMs": 900000,
+      "maxConcurrentDispatches": 1,
+      "minDispatchSpacingMs": 5000,
+      "dispatchAdmissionRetryMs": 15000,
 
       "routes": [
         {

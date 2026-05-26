@@ -85,6 +85,16 @@ export interface ResolvedOdooAccount {
    *  Also the staleness boundary for `dispatching` batches in boot recovery.
    *  Defaults to HARD_TIMEOUT_MS (900_000 = 15min). Capped at REPLAY_TTL_MS. */
   agentTimeoutMs: number;
+  /** Max Odoo inbox batches allowed to dispatch concurrently. Defaults to 1. */
+  maxConcurrentDispatches: number;
+  /** Delay before retrying a batch deferred by admission control. */
+  dispatchAdmissionRetryMs: number;
+  /** Minimum spacing between dispatch starts, in ms. Defaults to 5000. */
+  minDispatchSpacingMs: number;
+  /** Optional process RSS admission limit. 0 disables the check. */
+  maxProcessRssMb: number;
+  /** Optional event-loop p99 delay admission limit. 0 disables the check. */
+  maxEventLoopDelayMs: number;
 }
 
 // Per-account client cache
@@ -361,6 +371,36 @@ export function resolveAccount(
     min: 30_000,
     max: REPLAY_TTL_MS,
   });
+  const maxConcurrentDispatches = readBoundedInt(section.maxConcurrentDispatches, {
+    field: "maxConcurrentDispatches",
+    default: 1,
+    min: 1,
+    max: 10,
+  });
+  const dispatchAdmissionRetryMs = readBoundedInt(section.dispatchAdmissionRetryMs, {
+    field: "dispatchAdmissionRetryMs",
+    default: 15_000,
+    min: 250,
+    max: 300_000,
+  });
+  const minDispatchSpacingMs = readBoundedInt(section.minDispatchSpacingMs, {
+    field: "minDispatchSpacingMs",
+    default: 5_000,
+    min: 0,
+    max: 300_000,
+  });
+  const maxProcessRssMb = readBoundedInt(section.maxProcessRssMb, {
+    field: "maxProcessRssMb",
+    default: 0,
+    min: 0,
+    max: 131_072,
+  });
+  const maxEventLoopDelayMs = readBoundedInt(section.maxEventLoopDelayMs, {
+    field: "maxEventLoopDelayMs",
+    default: 0,
+    min: 0,
+    max: 60_000,
+  });
 
   return {
     accountId: _accountId ?? null,
@@ -375,6 +415,11 @@ export function resolveAccount(
     routes,
     debounceMs,
     agentTimeoutMs,
+    maxConcurrentDispatches,
+    dispatchAdmissionRetryMs,
+    minDispatchSpacingMs,
+    maxProcessRssMb,
+    maxEventLoopDelayMs,
   };
 }
 

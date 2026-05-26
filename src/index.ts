@@ -21,6 +21,7 @@ import {
   type InboundMessage,
 } from "./dispatch.js";
 import { createDebouncerAdapter } from "./debouncer-adapter.js";
+import { createDispatchAdmissionController } from "./inbox/admission.js";
 import { createInboxQueue } from "./inbox/queue.js";
 import { createRecordLock } from "./inbox/record-lock.js";
 import { runBootRecovery } from "./inbox/recovery.js";
@@ -101,6 +102,13 @@ const entry: any = defineChannelPluginEntry({
     // closure that dereferences `dispatchHandler` lazily — assigned
     // immediately below, so it's always populated at call time.
     let dispatchHandler: DispatchHandler | undefined;
+    const admission = createDispatchAdmissionController({
+      maxConcurrentDispatches: account.maxConcurrentDispatches,
+      retryDelayMs: account.dispatchAdmissionRetryMs,
+      minDispatchSpacingMs: account.minDispatchSpacingMs,
+      maxProcessRssMb: account.maxProcessRssMb,
+      maxEventLoopDelayMs: account.maxEventLoopDelayMs,
+    });
     const scheduler = createRetryScheduler({
       paths: inboxPaths,
       queue: inboxQueue,
@@ -112,6 +120,7 @@ const entry: any = defineChannelPluginEntry({
         }
         return dispatchHandler.processBatch(batch);
       },
+      admission,
       logger: api.logger,
     });
 
@@ -126,7 +135,7 @@ const entry: any = defineChannelPluginEntry({
 
     const onFlush = createDebouncerAdapter({
       paths: inboxPaths,
-      processBatch: (b) => dispatchHandler!.processBatch(b),
+      scheduleBatch: (b) => scheduler.scheduleAt(b, 0),
       logger: api.logger,
     });
 
@@ -190,7 +199,9 @@ const entry: any = defineChannelPluginEntry({
     })();
 
     api.logger.info(
-      `[odoo] Channel plugin loaded — webhook at ${account.webhookPath} (recovering...)`,
+      `[odoo] Channel plugin loaded — webhook at ${account.webhookPath} ` +
+        `(recovering..., maxConcurrentDispatches=${account.maxConcurrentDispatches}, ` +
+        `minDispatchSpacingMs=${account.minDispatchSpacingMs})`,
     );
   },
 });

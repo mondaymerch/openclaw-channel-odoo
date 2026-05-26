@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-05-26
+
+### Added
+
+- **Inbox dispatch admission control.** Debounced Odoo batches now drain through
+  the retry scheduler instead of directly starting agent runs. The scheduler can
+  defer batches without consuming retry attempts when concurrency, dispatch
+  spacing, process RSS, or event-loop delay limits are hit.
+- New `channels.odoo` backpressure knobs:
+  `maxConcurrentDispatches`, `minDispatchSpacingMs`,
+  `dispatchAdmissionRetryMs`, `maxProcessRssMb`, and
+  `maxEventLoopDelayMs`.
+
 ## [0.4.1-beta.1] — 2026-05-22
 
 ### Added

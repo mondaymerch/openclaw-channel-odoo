@@ -44,6 +44,34 @@
             "type": "string",
             "description": "Bot session ID passed in XML-RPC context (if required by some Odoo module)"
           },
+          "debounceMs": {
+            "type": "number",
+            "description": "Inbound debounce window before flushing a record batch to the inbox scheduler. Default: 3000."
+          },
+          "agentTimeoutMs": {
+            "type": "number",
+            "description": "Hard timeout for one dispatch attempt, including agent run and delivery. Default: 900000."
+          },
+          "maxConcurrentDispatches": {
+            "type": "number",
+            "description": "Maximum Odoo inbox batches allowed to dispatch concurrently. Default: 1."
+          },
+          "dispatchAdmissionRetryMs": {
+            "type": "number",
+            "description": "Delay before retrying an Odoo inbox batch deferred by admission control. Default: 15000."
+          },
+          "minDispatchSpacingMs": {
+            "type": "number",
+            "description": "Minimum spacing between Odoo dispatch starts. Default: 5000."
+          },
+          "maxProcessRssMb": {
+            "type": "number",
+            "description": "Optional process RSS admission limit in MB. 0 disables this check. Default: 0."
+          },
+          "maxEventLoopDelayMs": {
+            "type": "number",
+            "description": "Optional event-loop p99 admission limit in ms. 0 disables this check. Default: 0."
+          },
           "routes": {
             "type": "array",
             "minItems": 1,

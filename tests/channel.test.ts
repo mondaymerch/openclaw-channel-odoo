@@ -65,6 +65,32 @@ test("agentTimeoutMs override is surfaced on the resolved account", () => {
   assert.equal(account.agentTimeoutMs, 600_000);
 });
 
+test("dispatch admission knobs default to conservative queue draining", () => {
+  const account = resolveAccount(buildCfg());
+  assert.equal(account.maxConcurrentDispatches, 1);
+  assert.equal(account.minDispatchSpacingMs, 5_000);
+  assert.equal(account.dispatchAdmissionRetryMs, 15_000);
+  assert.equal(account.maxProcessRssMb, 0);
+  assert.equal(account.maxEventLoopDelayMs, 0);
+});
+
+test("dispatch admission knob overrides are surfaced on the resolved account", () => {
+  const account = resolveAccount(
+    buildCfg({
+      maxConcurrentDispatches: 2,
+      minDispatchSpacingMs: 10_000,
+      dispatchAdmissionRetryMs: 30_000,
+      maxProcessRssMb: 11_000,
+      maxEventLoopDelayMs: 5_000,
+    }),
+  );
+  assert.equal(account.maxConcurrentDispatches, 2);
+  assert.equal(account.minDispatchSpacingMs, 10_000);
+  assert.equal(account.dispatchAdmissionRetryMs, 30_000);
+  assert.equal(account.maxProcessRssMb, 11_000);
+  assert.equal(account.maxEventLoopDelayMs, 5_000);
+});
+
 test("debounceMs: 0 (no debounce) is accepted as the lower bound", () => {
   const account = resolveAccount(buildCfg({ debounceMs: 0 }));
   assert.equal(account.debounceMs, 0);

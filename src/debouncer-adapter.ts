@@ -2,10 +2,10 @@
  * Debouncer → persistent inbox adapter.
  *
  * Bridges the in-memory `createInboundDebouncer` (from openclaw plugin-sdk)
- * to the disk-backed `processBatch`. The webhook handler has already
+ * to the disk-backed inbox scheduler. The webhook handler has already
  * persisted each inbound message via `queue.appendOrCreateBatch`, so by
  * the time the debouncer's `onFlush` fires, the durable batch exists on
- * disk. The adapter just looks it up and hands it to `processBatch`.
+ * disk. The adapter just looks it up and schedules it for controlled drain.
  *
  * If the lookup returns null, the batch was moved between webhook ACK and
  * debouncer flush — possible if a scheduler-retry or a parallel processor
@@ -18,14 +18,14 @@ import { findOpenBatchForRecord, type InboxQueuePaths } from "./inbox/store.js";
 
 export type CreateDebouncerAdapterDeps = {
   paths: InboxQueuePaths;
-  processBatch: (batch: InboxBatch) => Promise<void>;
+  scheduleBatch: (batch: InboxBatch) => void | Promise<void>;
   logger: { info: (m: string) => void; error: (m: string) => void };
 };
 
 export function createDebouncerAdapter(
   deps: CreateDebouncerAdapterDeps,
 ): (items: InboundMessage[]) => Promise<void> {
-  const { paths, processBatch, logger } = deps;
+  const { paths, scheduleBatch, logger } = deps;
   return async (items) => {
     if (items.length === 0) return;
     const last = items[items.length - 1];
@@ -44,6 +44,6 @@ export function createDebouncerAdapter(
       );
       return;
     }
-    await processBatch(batch);
+    await scheduleBatch(batch);
   };
 }

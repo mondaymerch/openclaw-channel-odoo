@@ -20,6 +20,7 @@ import {
   logMessageProcessed,
   logRunAttempt,
 } from "openclaw/plugin-sdk/text-runtime";
+import type { AdmissionController } from "./admission.js";
 import type { BatchRef, InboxQueue } from "./queue.js";
 import { readBatch, type InboxQueuePaths } from "./store.js";
 import {
@@ -69,6 +70,11 @@ export type CreateRetrySchedulerDeps = {
    * implementer should record failures via the facade itself.
    */
   processBatch: ProcessBatchFn;
+  /**
+   * Optional dispatch gate. When it denies a batch, the scheduler requeues the
+   * same batch without recording a failure attempt.
+   */
+  admission?: AdmissionController;
   logger: {
     info: (msg: string) => void;
     error: (msg: string) => void;
@@ -98,7 +104,7 @@ function nextAction(batch: InboxBatch, failureClass: FailureClass): NextAction {
 // ---- Factory -------------------------------------------------------------
 
 export function createRetryScheduler(deps: CreateRetrySchedulerDeps): RetryScheduler {
-  const { paths, queue, processBatch, logger } = deps;
+  const { paths, queue, processBatch, admission, logger } = deps;
   const setTimer = deps.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
   const clearTimer = deps.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
 
@@ -116,12 +122,23 @@ export function createRetryScheduler(deps: CreateRetrySchedulerDeps): RetrySched
     timers.delete(batchKey);
     const current = await readBatch(paths, batchKey);
     if (!current) return;   // race: file unlinked between schedule and fire
+    const decision = admission?.tryAcquire(current);
+    if (decision && !decision.ok) {
+      logger.info(
+        `[odoo] inbox.admission deferred batchKey=${batchKey} ` +
+          `reason=${decision.reason} retryMs=${decision.retryMs}`,
+      );
+      scheduleAt(current, decision.retryMs);
+      return;
+    }
     try {
       await processBatch(current);
     } catch (err) {
       logger.error(
         `[odoo] inbox.fire processBatch threw batchKey=${batchKey}: ${formatError(err)}`,
       );
+    } finally {
+      decision?.ticket.release();
     }
   }
 

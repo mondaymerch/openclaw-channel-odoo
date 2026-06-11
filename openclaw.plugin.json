@@ -4,6 +4,9 @@
   "channels": ["odoo"],
   "name": "Odoo",
   "description": "Route AI conversations through Odoo chatter via XML-RPC",
+  "contracts": {
+    "tools": ["odoo_search_read"]
+  },
   "configSchema": {
     "type": "object",
     "properties": {

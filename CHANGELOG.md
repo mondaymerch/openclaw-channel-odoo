@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-06-11
+
+### Fixed
+
+- **`odoo_search_read` now registers on current OpenClaw core.** The manifest did
+  not declare `contracts.tools`, so core (>= 2026.5.31) refused to register the
+  tool: `registerTool` requires every agent tool to be declared under
+  `contracts.tools` first, otherwise it logs a diagnostic and returns without
+  registering. The tool was silently absent from every agent's tool surface.
+  Agents restricted via `tools.allow: ["odoo_search_read"]` therefore failed at
+  precheck with `No callable tools remain after resolving explicit tool allowlist
+  … no registered tools matched`, which surfaced downstream as Raven recipe-run
+  timeouts (e.g. Strategic Client Investigation, Customer Success Handover).
+  Added `"contracts": { "tools": ["odoo_search_read"] }` to the manifest so the
+  read-only tool registers and explicit allowlists resolve correctly.
+
 ## [0.4.2] — 2026-05-26
 
 ### Added

@@ -166,10 +166,12 @@ const planTokenField = Type.Optional(
   }),
 );
 
-// `{id}` or `{name}` selector objects. Both keys are optional at the schema
+// `{id}` or `{name}` selector object. Both keys are optional at the schema
 // level and additionalProperties:false; the server requires exactly one and
-// returns a structured error (e.g. vendor_not_found / so_not_found) otherwise —
-// keeping the helpful hint on the server side rather than as a schema error.
+// returns a structured error (e.g. so_not_found) otherwise — keeping the
+// helpful hint on the server side rather than as a schema error. Kept generic
+// across both tools; per-tool server-side derivations (partner for spawn,
+// company/currency for custom) are documented on each tool, not here.
 const targetSoField = Type.Optional(
   Type.Object(
     {
@@ -186,8 +188,7 @@ const targetSoField = Type.Optional(
         "Optional. When set, a sale.order.line is appended after creation. " +
         "Identify the order by EXACTLY ONE of `id` or `name`. The SO must be in " +
         "draft state and its platform must match platform_id (else so_not_draft " +
-        "/ so_platform_mismatch). partner is ALWAYS derived from this SO " +
-        "server-side — never pass it.",
+        "/ so_platform_mismatch).",
     },
   ),
 );
@@ -206,8 +207,10 @@ export function createOdooSpawnCustomerProductTool(cfg: OpenClawConfig) {
       "dry-run/approval flow server-side and returns a structured response " +
       "envelope (never a raw traceback). ALWAYS call with dry_run:true first, " +
       "present the returned plan to a human, then execute with the plan_token. " +
-      "For an out-of-catalogue product with no parent, use " +
-      "odoo_create_custom_product instead.",
+      "When target_so is set, the appended line's partner is always derived " +
+      "from that SO server-side — never attempt to pass a partner. For an " +
+      "out-of-catalogue product with no parent, use odoo_create_custom_product " +
+      "instead.",
     parameters: Type.Object(
       {
         parent_variant_id: Type.Integer({
@@ -242,7 +245,10 @@ export function createOdooSpawnCustomerProductTool(cfg: OpenClawConfig) {
           Type.Integer({
             description:
               "Required when target_so is set (ignored otherwise). Quantity for " +
-              "the appended order line; the server validates it is > 0.",
+              "the appended order line, in whole units — merch quantities are " +
+              "never fractional (the underlying Odoo product_uom_qty is a Float, " +
+              "but this tool is deliberately stricter). The server validates it " +
+              "is > 0.",
           }),
         ),
         client_ref: clientRefField,
@@ -346,8 +352,10 @@ export function createOdooCreateCustomProductTool(cfg: OpenClawConfig) {
         ),
         quantity: Type.Integer({
           description:
-            "Required, must be > 0. Becomes supplierinfo.min_qty, and the " +
-            "order-line quantity when target_so is set.",
+            "Required, must be > 0, in whole units — merch quantities are never " +
+            "fractional (the underlying Odoo supplierinfo.min_qty is a Float, " +
+            "but this tool is deliberately stricter). Becomes supplierinfo." +
+            "min_qty, and the order-line quantity when target_so is set.",
         }),
         unit_cost: Type.Number({
           description:

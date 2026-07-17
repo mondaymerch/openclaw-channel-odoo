@@ -158,8 +158,9 @@ export class OdooClient {
    * `agent.api` service methods (e.g. spawn_customer_product) whose single
    * positional argument is the payload dict, and return the method's response
    * envelope verbatim. `botSessionId` is merged into the call context the same
-   * way `searchRead`/`callReply` do it — without clobbering a caller-supplied
-   * context object.
+   * way `callReply` does it — added to any caller-supplied context object
+   * without clobbering it (unlike `searchRead`, which overwrites context
+   * wholesale; here we preserve caller keys).
    *
    * Named `callMethod` rather than reusing the private `executeKw` name to
    * avoid shadowing the raw transport while adding the context-injection layer.

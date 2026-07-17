@@ -193,8 +193,21 @@ test("custom: rejects forbidden field `list_price`", () => {
   assert.equal(Value.Check(customTool.parameters, payload), false);
 });
 
-test("custom: rejects forbidden derived fields (company_id, currency_id, categ_id, print_design_ids)", () => {
-  for (const key of ["company_id", "currency_id", "categ_id", "hs_code", "mm_partner_id", "print_design_ids"]) {
+test("custom: rejects forbidden derived/never-set fields", () => {
+  // The spec's "Never set" list (Action 2 step 5) plus the derived
+  // company/currency: none may be accepted as a payload key.
+  const forbidden = [
+    "company_id",
+    "currency_id",
+    "categ_id",
+    "hs_code",
+    "product_size_category",
+    "mm_responsible_id",
+    "mm_design_status_id",
+    "mm_partner_id",
+    "print_design_ids",
+  ];
+  for (const key of forbidden) {
     const payload = { ...customSpecPayload, [key]: 1 };
     assert.equal(
       Value.Check(customTool.parameters, payload),

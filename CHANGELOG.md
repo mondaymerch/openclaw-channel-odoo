@@ -31,8 +31,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
   Both tool names are declared under `contracts.tools` in the manifest —
   required for current OpenClaw core to register them (see 0.4.3) — and a new
-  `client.callMethod()` adds a generic `execute_kw` transport that injects
-  `bot_session_id` into the call context the same way `searchRead` does.
+  `client.callMethod()` adds a generic `execute_kw` transport that merges
+  `bot_session_id` into the call context without clobbering a caller-supplied
+  context object (mirroring `callReply`'s merge, not `searchRead`'s wholesale
+  overwrite).
 
 ## [0.4.3] — 2026-06-11
 

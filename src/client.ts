@@ -152,6 +152,37 @@ export class OdooClient {
   }
 
   /**
+   * Call an arbitrary model method via XML-RPC execute_kw.
+   *
+   * Generic transport used by the product-creation agent tools: they call
+   * `agent.api` service methods (e.g. spawn_customer_product) whose single
+   * positional argument is the payload dict, and return the method's response
+   * envelope verbatim. `botSessionId` is merged into the call context the same
+   * way `searchRead`/`callReply` do it — without clobbering a caller-supplied
+   * context object.
+   *
+   * Named `callMethod` rather than reusing the private `executeKw` name to
+   * avoid shadowing the raw transport while adding the context-injection layer.
+   */
+  async callMethod(params: {
+    model: string;
+    method: string;
+    args: any[];
+    kwargs?: Record<string, any>;
+    botSessionId?: string | null;
+  }): Promise<any> {
+    const kwargs: Record<string, any> = { ...(params.kwargs ?? {}) };
+    if (params.botSessionId) {
+      const existingContext =
+        kwargs.context && typeof kwargs.context === "object" && !Array.isArray(kwargs.context)
+          ? (kwargs.context as Record<string, any>)
+          : {};
+      kwargs.context = { ...existingContext, bot_session_id: params.botSessionId };
+    }
+    return this.executeKw(params.model, params.method, params.args, kwargs);
+  }
+
+  /**
    * Read record display name (for agent context).
    */
   async getRecordName(model: string, resId: number): Promise<string> {

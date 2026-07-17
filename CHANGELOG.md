@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-17
+
+### Added
+
+- **Two typed product-creation agent tools** backed by the new `agent.api` Odoo
+  service model (part of the `openclaw_agent_api` project):
+  - `odoo_spawn_customer_product` — spawn a platform-bound customer product from
+    a catalogue parent template (reuse-first dedup, validity gates, optional
+    SO-line append).
+  - `odoo_create_custom_product` — create an out-of-catalogue custom product
+    (product.template + product.supplierinfo, derived sale price, optional
+    SO-line append).
+
+  Both tools are thin transport following the existing `odoo_search_read`
+  pattern: they forward the payload as the single positional argument to the
+  `agent.api` method and return its structured response envelope VERBATIM
+  (never transformed, `ok:false` failures never swallowed). All validation,
+  dedup, dry-run/approval, idempotency and VAT/price correctness live in the
+  Odoo method. TypeBox schemas enforce structure/type/required/enums and
+  `additionalProperties: false` (blocking fields the agent must never pass, e.g.
+  `partner`, `list_price`); value semantics are validated server-side so every
+  problem is returned in one response.
+
+  Both tool names are declared under `contracts.tools` in the manifest —
+  required for current OpenClaw core to register them (see 0.4.3) — and a new
+  `client.callMethod()` adds a generic `execute_kw` transport that injects
+  `bot_session_id` into the call context the same way `searchRead` does.
+
 ## [0.4.3] — 2026-06-11
 
 ### Fixed

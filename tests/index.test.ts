@@ -105,7 +105,14 @@ test("registerFull keeps tool registration repeatable but starts channel side ef
     );
 
     assert.equal(harness.channels.length, 2, "channel capability is still registered per load");
-    assert.deepEqual(harness.tools, ["odoo_search_read", "odoo_search_read"]);
+    assert.deepEqual(harness.tools, [
+      "odoo_search_read",
+      "odoo_spawn_customer_product",
+      "odoo_create_custom_product",
+      "odoo_search_read",
+      "odoo_spawn_customer_product",
+      "odoo_create_custom_product",
+    ]);
     assert.equal(harness.routes.length, 1, "webhook route must not be registered twice");
     assert.equal(
       harness.infos.filter((m) => m.includes("Channel plugin loaded")).length,

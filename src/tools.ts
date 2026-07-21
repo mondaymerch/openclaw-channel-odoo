@@ -590,6 +590,159 @@ function opNotPermittedHint(model: string): string {
   );
 }
 
+// ---------------------------------------------------------------------------
+// x2many command-cascade guard.
+//
+// The (model, method) allowlist is not enough: Odoo processes x2many command
+// tuples inside `vals` by cascading create/write/unlink onto the COMODEL, which
+// happens BELOW execute_kw where the allowlist can't see it. sale.order has
+// x2many fields pointing at product.template (product_to_archive_ids M2M,
+// pack_ids O2M), and a created/updated product.template can nest seller_ids
+// (product.supplierinfo). So a permitted sale.order.write/create with
+// `{"product_to_archive_ids": [[0,0,{...,"seller_ids":[[0,0,{}]]}]]}` would be
+// full product CRUD — a bypass of the hard rule. We therefore inspect the vals
+// here and reject any comodel-mutating command tuple.
+//
+// Command codes (Odoo ORM): 0 CREATE, 1 UPDATE, 2 DELETE, 3 UNLINK-relation,
+// 4 LINK, 5 DELETE-ALL-relations, 6 REPLACE. {0,1,2,5} mutate/clear the comodel
+// (5 can clear an O2M inverse); {3,4,6} only touch the relation table and are
+// always allowed. The ONE allowed comodel-mutating command is (0,0,{...}) on
+// `order_line` for sale.order.create — we recurse into that line's vals and
+// apply the same rule, so a nested product/supplierinfo create is still caught.
+const COMODEL_MUTATING_CODES = new Set([0, 1, 2, 5]);
+
+// A single ORM command tuple: [code] | [code, id] | [code, id, values], where
+// code is an integer 0..6. Values from JSON are arrays, never tuples.
+function isCommandTuple(x: unknown): boolean {
+  return (
+    Array.isArray(x) &&
+    x.length >= 1 &&
+    x.length <= 3 &&
+    typeof x[0] === "number" &&
+    Number.isInteger(x[0]) &&
+    (x[0] as number) >= 0 &&
+    (x[0] as number) <= 6
+  );
+}
+
+// Classify an array that appears as a FIELD VALUE inside a vals dict. The
+// canonical x2many shape is a list of command tuples ([[0,0,{}],[4,5]]); a
+// bare tuple ([0,0,{}]) is accepted defensively as a single command. Anything
+// else non-empty is an unrecognized shape — treated as malformed and rejected
+// (safe default), since no legitimate Odoo vals has a non-command array value.
+function classifyFieldArray(
+  value: unknown[],
+):
+  | { kind: "commands"; commands: unknown[][] }
+  | { kind: "empty" }
+  | { kind: "malformed" } {
+  if (value.length === 0) return { kind: "empty" };
+  if (value.every((el) => isCommandTuple(el))) {
+    return { kind: "commands", commands: value as unknown[][] };
+  }
+  if (isCommandTuple(value)) {
+    return { kind: "commands", commands: [value] };
+  }
+  return { kind: "malformed" };
+}
+
+interface QuoteRpcViolation {
+  code: string;
+  message: string;
+  hint: string;
+}
+
+const UNSAFE_RELATIONAL_WRITE_HINT =
+  "this tool cannot create/update/delete related records through x2many " +
+  "command tuples (only order_line creation on sale.order.create is allowed); " +
+  "product data must go through odoo_spawn_customer_product / " +
+  "odoo_create_custom_product, or hand off to a human";
+
+// Walk an op's args + kwargs, rejecting any comodel-mutating x2many command.
+// All dicts reachable in args/kwargs are scanned (vals live at create args[0],
+// write args[1], copy kwargs.default, message_post kwargs; scanning everything
+// also catches vals hidden in nested command values or default_* context keys).
+// Only dict FIELD VALUES are treated as command lists — the top-level ids arg
+// (e.g. write args[0] = [id]) is a structural array, never a field value.
+function scanForUnsafeCommands(
+  op: QuoteRpcOp,
+  opIndex: number,
+  violations: QuoteRpcViolation[],
+): void {
+  const seen = new Set<unknown>();
+
+  const flag = (field: string, detail: string): void => {
+    violations.push({
+      code: "unsafe_relational_write",
+      message: `op[${opIndex}] ${op.model}.${op.method}: field "${field}" ${detail}`,
+      hint: UNSAFE_RELATIONAL_WRITE_HINT,
+    });
+  };
+
+  const scanDict = (dict: Record<string, unknown>): void => {
+    if (seen.has(dict)) return;
+    seen.add(dict);
+    for (const [key, value] of Object.entries(dict)) {
+      if (Array.isArray(value)) {
+        const parsed = classifyFieldArray(value);
+        if (parsed.kind === "empty") continue;
+        if (parsed.kind === "malformed") {
+          flag(
+            key,
+            "has an unrecognized array value (possible x2many command); rejected as a safety default",
+          );
+          continue;
+        }
+        for (const cmd of parsed.commands) {
+          const code = cmd[0] as number;
+          if (!COMODEL_MUTATING_CODES.has(code)) continue; // 3/4/6 relation-only
+          const isOrderLineCreate =
+            code === 0 &&
+            key === "order_line" &&
+            op.model === "sale.order" &&
+            op.method === "create";
+          if (isOrderLineCreate) {
+            // Allowed line create — recurse into the line vals and re-apply the
+            // rule so a nested seller_ids/product create inside a line is caught.
+            const lineVals = cmd[2];
+            if (
+              lineVals !== null &&
+              typeof lineVals === "object" &&
+              !Array.isArray(lineVals)
+            ) {
+              scanDict(lineVals as Record<string, unknown>);
+            }
+            continue;
+          }
+          flag(
+            key,
+            `uses x2many command code ${code} (create/update/delete on the related model), which is not permitted`,
+          );
+        }
+      } else if (value !== null && typeof value === "object") {
+        scanDict(value as Record<string, unknown>);
+      }
+    }
+  };
+
+  // Structural descent for arrays that are NOT dict field values (args array,
+  // ids lists) — never classified as commands; only their nested dicts matter.
+  const walkStructural = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      if (seen.has(node)) return;
+      seen.add(node);
+      for (const el of node) walkStructural(el);
+    } else if (node !== null && typeof node === "object") {
+      scanDict(node as Record<string, unknown>);
+    }
+  };
+
+  if (Array.isArray(op.args)) walkStructural(op.args);
+  if (op.kwargs !== null && typeof op.kwargs === "object") {
+    scanDict(op.kwargs as Record<string, unknown>);
+  }
+}
+
 /**
  * Minimal OdooClient surface the bridge needs. The real client satisfies it;
  * tests inject a stub (or a real client with a stubbed transport).
@@ -729,6 +882,13 @@ const QUOTE_RPC_DESCRIPTION =
   "product.supplierinfo through this tool under any input. To create or change " +
   "product data use odoo_spawn_customer_product / odoo_create_custom_product, or " +
   "hand off to a human. print.design is the only product-adjacent write.\n\n" +
+  "NESTED WRITES: x2many command tuples in vals that CREATE/UPDATE/DELETE " +
+  "related records (command codes 0/1/2/5) are rejected (unsafe_relational_write) " +
+  "— they would cascade onto comodels (e.g. product.template via " +
+  "product_to_archive_ids/pack_ids) and bypass the rule above. The ONE exception " +
+  "is creating order lines on sale.order.create (order_line [[0,0,{...}]]); its " +
+  "line vals are scanned the same way. Relation-only commands — link/unlink-" +
+  "relation/replace (codes 3/4/6), e.g. tag_ids [[6,0,[ids]]] — are allowed.\n\n" +
   "BATCH: `ops` is an ordered array of {model, method, args, kwargs?}. `args` is " +
   "the standard execute_kw positional array (create [{vals}]; write " +
   "[[ids],{vals}]; unlink [[ids]]; copy [id] with optional kwargs.default; " +
@@ -879,28 +1039,30 @@ export function createOdooQuoteRpcTool(
         details: undefined,
       });
 
-      // Scope validation — shared by dry-run and execute (defense in depth on
-      // the execute path). All violations are reported at once.
-      const scopeViolations: Array<{
-        code: string;
-        message: string;
-        hint: string;
-      }> = [];
+      // Validation — shared by dry-run and execute (defense in depth on the
+      // execute path). All violations are reported at once. Two gates: (1) the
+      // (model, method) allowlist; (2) a recursive vals scan that rejects any
+      // x2many command tuple which would cascade a create/update/delete onto a
+      // comodel (the product-write bypass). An out-of-scope op is skipped for
+      // the deeper scan — it is already dead.
+      const violations: QuoteRpcViolation[] = [];
       ops.forEach((op, index) => {
         if (!isOpPermitted(op.model, op.method)) {
-          scopeViolations.push({
+          violations.push({
             code: "op_not_permitted",
             message: `op[${index}] ${op.model}.${op.method} is not permitted by odoo_quote_rpc`,
             hint: opNotPermittedHint(op.model),
           });
+          return;
         }
+        scanForUnsafeCommands(op, index, violations);
       });
 
       // -------------------------------- DRY RUN ------------------------------
       if (params.dry_run === true) {
-        if (scopeViolations.length > 0) {
-          // Nothing is sent to Odoo if any op is out of scope.
-          return wrap({ ok: false, errors: scopeViolations });
+        if (violations.length > 0) {
+          // Nothing is sent to Odoo if any op is out of scope or unsafe.
+          return wrap({ ok: false, errors: violations });
         }
 
         const plan: Array<Record<string, unknown>> = [];
@@ -1024,9 +1186,10 @@ export function createOdooQuoteRpcTool(
         });
       }
 
-      // Defense in depth: re-validate scope before executing anything.
-      if (scopeViolations.length > 0) {
-        return wrap({ ok: false, errors: scopeViolations });
+      // Defense in depth: re-validate scope AND the x2many-cascade guard before
+      // executing anything.
+      if (violations.length > 0) {
+        return wrap({ ok: false, errors: violations });
       }
 
       const results: Array<{

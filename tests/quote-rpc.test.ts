@@ -528,6 +528,204 @@ test("bot_session_id lands in the dry-run search_read context (real client trans
 });
 
 // --------------------------------------------------------------------------
+// x2many command-cascade guard (product-write bypass)
+// --------------------------------------------------------------------------
+
+const SO = 500;
+
+test("cascade guard: PRIMARY bypass (product_to_archive_ids create + nested seller_ids) rejected; nothing sent", async () => {
+  const stub = makeStub();
+  const tool = newTool(stub.client);
+  const ops = [
+    {
+      model: "sale.order",
+      method: "write",
+      args: [
+        [SO],
+        {
+          product_to_archive_ids: [
+            [0, 0, { name: "X", seller_ids: [[0, 0, { name: 8412 }]] }],
+          ],
+        },
+      ],
+    },
+  ];
+  const env = await run(tool, { ops, dry_run: true });
+  assert.equal(env.ok, false);
+  assert.ok(env.errors.some((e: AnyRec) => e.code === "unsafe_relational_write"));
+  assert.equal(stub.calls.callMethod.length, 0);
+  assert.equal(stub.calls.searchRead.length, 0);
+});
+
+test("cascade guard: sale.order.create order_line nesting a seller_ids create is rejected", async () => {
+  const stub = makeStub();
+  const tool = newTool(stub.client);
+  const ops = [
+    {
+      model: "sale.order",
+      method: "create",
+      args: [
+        {
+          partner_id: 1,
+          order_line: [
+            [0, 0, { product_id: 9, product_uom_qty: 1, seller_ids: [[0, 0, { name: 8412 }]] }],
+          ],
+        },
+      ],
+    },
+  ];
+  const env = await run(tool, { ops, dry_run: true });
+  assert.equal(env.ok, false);
+  const v = env.errors.find((e: AnyRec) => e.code === "unsafe_relational_write");
+  assert.ok(v, "expected an unsafe_relational_write violation");
+  assert.match(v.message, /seller_ids/);
+  assert.equal(stub.calls.callMethod.length, 0);
+});
+
+const rejectedCascadeCases: Array<{ name: string; op: AnyRec }> = [
+  {
+    name: "product_to_archive_ids update [[1,id,{}]]",
+    op: { model: "sale.order", method: "write", args: [[SO], { product_to_archive_ids: [[1, 77, { name: "y" }]] }] },
+  },
+  {
+    name: "product_to_archive_ids delete [[2,id]]",
+    op: { model: "sale.order", method: "write", args: [[SO], { product_to_archive_ids: [[2, 77]] }] },
+  },
+  {
+    name: "pack_ids update [[1,id,{}]]",
+    op: { model: "sale.order", method: "write", args: [[SO], { pack_ids: [[1, 88, { name: "z" }]] }] },
+  },
+  {
+    name: "tag_ids create [[0,0,{}]] (code 0 not under order_line)",
+    op: { model: "sale.order", method: "write", args: [[SO], { tag_ids: [[0, 0, { name: "t" }]] }] },
+  },
+  {
+    name: "order_line create on WRITE (only create is excepted)",
+    op: { model: "sale.order", method: "write", args: [[SO], { order_line: [[0, 0, { product_id: 9 }]] }] },
+  },
+  {
+    name: "command 5 (delete-all-relations)",
+    op: { model: "sale.order", method: "write", args: [[SO], { order_line: [[5, 0, 0]] }] },
+  },
+  {
+    name: "create with product_to_archive_ids create",
+    op: { model: "sale.order", method: "create", args: [{ partner_id: 1, product_to_archive_ids: [[0, 0, { name: "P" }]] }] },
+  },
+  {
+    name: "copy default with product_to_archive_ids create",
+    op: { model: "sale.order", method: "copy", args: [SO], kwargs: { default: { product_to_archive_ids: [[0, 0, { name: "P" }]] } } },
+  },
+  {
+    name: "message_post with attachment_ids create",
+    op: { model: "sale.order", method: "message_post", args: [[SO]], kwargs: { body: "hi", attachment_ids: [[0, 0, { name: "a" }]] } },
+  },
+  {
+    name: "unrecognized array field value (malformed -> safe-default reject)",
+    op: { model: "sale.order", method: "write", args: [[SO], { some_field: [[0, 0, {}], "junk"] }] },
+  },
+];
+
+for (const c of rejectedCascadeCases) {
+  test(`cascade guard: rejected — ${c.name}; nothing sent`, async () => {
+    const stub = makeStub();
+    const tool = newTool(stub.client);
+    const env = await run(tool, { ops: [c.op], dry_run: true });
+    assert.equal(env.ok, false, JSON.stringify(env));
+    assert.ok(
+      env.errors.some((e: AnyRec) => e.code === "unsafe_relational_write"),
+      JSON.stringify(env.errors),
+    );
+    assert.equal(stub.calls.callMethod.length, 0);
+    assert.equal(stub.calls.searchRead.length, 0);
+  });
+}
+
+const acceptedCascadeCases: Array<{ name: string; op: AnyRec }> = [
+  {
+    name: "sale.order.create order_line with tax_id replace (code 6)",
+    op: {
+      model: "sale.order",
+      method: "create",
+      args: [
+        {
+          partner_id: 1,
+          order_line: [
+            [0, 0, { product_id: 9, product_uom_qty: 1, price_unit: 2, name: "L", tax_id: [[6, 0, [3]]] }],
+          ],
+        },
+      ],
+    },
+  },
+  {
+    name: "print.design.create with print_color_ids/madeira_color_ids replace (code 6)",
+    op: { model: "print.design", method: "create", args: [{ name: "D", print_color_ids: [[6, 0, [1, 2]]], madeira_color_ids: [[6, 0, [5]]] }] },
+  },
+  {
+    name: "sale.order.write tag_ids link (code 4)",
+    op: { model: "sale.order", method: "write", args: [[SO], { tag_ids: [[4, 12]] }] },
+  },
+  {
+    name: "sale.order.write tag_ids replace (code 6)",
+    op: { model: "sale.order", method: "write", args: [[SO], { tag_ids: [[6, 0, [12, 13]]] }] },
+  },
+  {
+    name: "sale.order.write scalar vals only",
+    op: { model: "sale.order", method: "write", args: [[SO], { note: "hello" }] },
+  },
+  {
+    name: "sale.order.write with an empty x2many list (no commands)",
+    op: { model: "sale.order", method: "write", args: [[SO], { order_line: [] }] },
+  },
+  {
+    name: "sale.order.line.write scalar qty",
+    op: { model: "sale.order.line", method: "write", args: [[42], { product_uom_qty: 3 }] },
+  },
+];
+
+for (const c of acceptedCascadeCases) {
+  test(`cascade guard: accepted — ${c.name}`, async () => {
+    const stub = makeStub();
+    const tool = newTool(stub.client);
+    const env = await run(tool, { ops: [c.op], dry_run: true });
+    assert.equal(env.ok, true, JSON.stringify(env));
+    assert.ok(typeof env.plan_token === "string" && env.plan_token.startsWith("sha256:"));
+  });
+}
+
+test("cascade guard: rejected on the execute path with a valid self-computed token; nothing sent", async () => {
+  const stub = makeStub();
+  const tool = newTool(stub.client);
+  const ops = [
+    { model: "sale.order", method: "write", args: [[SO], { product_to_archive_ids: [[0, 0, { name: "X" }]] }] },
+  ];
+  const env = await run(tool, {
+    ops,
+    plan_token: computePlanToken(ops),
+    client_ref: "cref-cascade-dd",
+  });
+  assert.equal(env.ok, false);
+  assert.ok(env.errors.some((e: AnyRec) => e.code === "unsafe_relational_write"));
+  assert.equal(stub.calls.callMethod.length, 0);
+});
+
+test("cascade guard: batched scope + cascade violations reported together; nothing sent", async () => {
+  const stub = makeStub();
+  const tool = newTool(stub.client);
+  const ops = [
+    { model: "product.template", method: "write", args: [[1], { name: "x" }] }, // op_not_permitted
+    { model: "sale.order", method: "write", args: [[SO], { pack_ids: [[1, 2, {}]] }] }, // unsafe
+    { model: "sale.order", method: "write", args: [[SO], { note: "ok" }] }, // clean
+  ];
+  const env = await run(tool, { ops, dry_run: true });
+  assert.equal(env.ok, false);
+  const codes = env.errors.map((e: AnyRec) => e.code);
+  assert.ok(codes.includes("op_not_permitted"));
+  assert.ok(codes.includes("unsafe_relational_write"));
+  assert.equal(stub.calls.callMethod.length, 0);
+  assert.equal(stub.calls.searchRead.length, 0);
+});
+
+// --------------------------------------------------------------------------
 // plan_token canonicalization
 // --------------------------------------------------------------------------
 

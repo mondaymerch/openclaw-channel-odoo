@@ -29,6 +29,7 @@
  *   "all errors at once" guarantee and create a second source of truth.
  */
 
+import { createHash } from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import { OdooClient } from "./client.js";
@@ -507,6 +508,603 @@ export function createOdooCreateCustomProductTool(cfg: OpenClawConfig) {
         ],
         details: undefined,
       };
+    },
+  });
+}
+
+// ===========================================================================
+// odoo_quote_rpc — TEMPORARY scoped execute_kw bridge for quote editing.
+//
+// A passthrough that runs Odoo execute_kw with the gateway's credentials, but
+// ONLY for the (model, method) pairs in QUOTE_RPC_SCOPE, enforced here in
+// plugin code before any RPC leaves the process. It is deliberately a bridge:
+// each operation migrates to a dedicated deterministic tool (update_quote /
+// configure_addons in wave 2, create_quote in wave 3) and this tool is removed
+// once they ship.
+//
+// The scope table is hardcoded on purpose — widening what the agent can write
+// is always a reviewed plugin release, never a config or prompt change.
+// ===========================================================================
+
+/** Allowlist: model -> permitted methods. The ONLY pairs this bridge runs. */
+export const QUOTE_RPC_SCOPE: Readonly<Record<string, readonly string[]>> = {
+  "sale.order": [
+    "create",
+    "write",
+    "copy",
+    "message_post",
+    "action_recalculate_handling_costs",
+  ],
+  "sale.order.line": ["write", "unlink"],
+  "print.design": ["create", "write", "unlink"],
+  "product.template": ["message_post"],
+  "product.product": ["message_post"],
+};
+
+// Defense in depth. These pairs must NEVER pass, even if QUOTE_RPC_SCOPE is
+// later edited incorrectly: no product-data create/write/unlink/copy/etc. is
+// reachable through this bridge. print.design is the sole product-adjacent
+// write, by decision; product.template/product.product get message_post only.
+const HARD_FORBIDDEN_MODELS = new Set([
+  "product.template",
+  "product.product",
+  "product.supplierinfo",
+]);
+const HARD_FORBIDDEN_METHODS = new Set([
+  "create",
+  "write",
+  "unlink",
+  "copy",
+  "name_create",
+  "copy_data",
+  "load",
+]);
+
+/**
+ * True iff (model, method) is allowed through the bridge. The hard-forbidden
+ * gate runs FIRST so a mistaken scope-table edit can't open a product write —
+ * this is the "hard rule" the refusal tests pin.
+ */
+export function isOpPermitted(model: string, method: string): boolean {
+  if (HARD_FORBIDDEN_MODELS.has(model) && HARD_FORBIDDEN_METHODS.has(method)) {
+    return false;
+  }
+  const methods = QUOTE_RPC_SCOPE[model];
+  return methods !== undefined && methods.includes(method);
+}
+
+function opNotPermittedHint(model: string): string {
+  if (HARD_FORBIDDEN_MODELS.has(model)) {
+    return (
+      "product data writes are not available to this agent; use " +
+      "odoo_spawn_customer_product / odoo_create_custom_product, or hand off " +
+      "to a human"
+    );
+  }
+  return (
+    "this (model, method) pair is outside the bridge scope; permitted: " +
+    "sale.order {create, write, copy, message_post, " +
+    "action_recalculate_handling_costs}, sale.order.line {write, unlink}, " +
+    "print.design {create, write, unlink}, product.template/product.product " +
+    "{message_post}; otherwise hand off to a human"
+  );
+}
+
+/**
+ * Minimal OdooClient surface the bridge needs. The real client satisfies it;
+ * tests inject a stub (or a real client with a stubbed transport).
+ */
+export type QuoteRpcClient = Pick<OdooClient, "callMethod" | "searchRead">;
+
+interface QuoteRpcOp {
+  model: string;
+  method: string;
+  args: unknown[];
+  kwargs?: Record<string, unknown>;
+}
+
+interface QuoteRpcParams {
+  ops: QuoteRpcOp[];
+  dry_run?: boolean;
+  plan_token?: string;
+  client_ref?: string;
+}
+
+// Recursively sort object keys (arrays keep their order) so JSON.stringify is a
+// canonical serialization — the basis for the plan_token / idempotency hash.
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      out[key] = canonicalize((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * plan_token = "sha256:" + hex(sha256(canonical JSON of the ops array)).
+ * Binds ARGS ONLY — never database state (the documented no-drift caveat).
+ */
+export function computePlanToken(ops: unknown): string {
+  const canonicalJson = JSON.stringify(canonicalize(ops));
+  return "sha256:" + createHash("sha256").update(canonicalJson).digest("hex");
+}
+
+// Target ids for the dry-run echo / summary. args[0] is a bare int (copy) or a
+// list of ids (write/unlink). Anything else is unparseable -> empty + a note.
+function extractTargetIds(args: unknown[]): {
+  ids: number[];
+  parseable: boolean;
+} {
+  const first = Array.isArray(args) ? args[0] : undefined;
+  if (typeof first === "number" && Number.isInteger(first)) {
+    return { ids: [first], parseable: true };
+  }
+  if (Array.isArray(first)) {
+    const ids = first.filter(
+      (x): x is number => typeof x === "number" && Number.isInteger(x),
+    );
+    return { ids, parseable: true };
+  }
+  return { ids: [], parseable: false };
+}
+
+function valsFieldList(vals: unknown): string {
+  if (vals !== null && typeof vals === "object" && !Array.isArray(vals)) {
+    const keys = Object.keys(vals as Record<string, unknown>);
+    return keys.length ? ` — fields: ${keys.join(", ")}` : "";
+  }
+  return "";
+}
+
+function idsLabel(idInfo: { ids: number[]; parseable: boolean }): string {
+  if (!idInfo.parseable) return "(target ids unparseable from args[0])";
+  if (idInfo.ids.length === 0) return "(no target ids)";
+  return `ids [${idInfo.ids.join(", ")}]`;
+}
+
+function summarizeOp(
+  op: QuoteRpcOp,
+  idInfo: { ids: number[]; parseable: boolean } | null,
+): string {
+  const args = Array.isArray(op.args) ? op.args : [];
+  switch (op.method) {
+    case "create":
+      return `create ${op.model}${valsFieldList(args[0])}`;
+    case "write":
+      return `write ${op.model} ${idsLabel(idInfo ?? extractTargetIds(args))}${valsFieldList(args[1])}`;
+    case "unlink":
+      return `unlink ${op.model} ${idsLabel(idInfo ?? extractTargetIds(args))}`;
+    case "copy": {
+      const def =
+        op.kwargs && typeof op.kwargs === "object"
+          ? (op.kwargs as Record<string, unknown>).default
+          : undefined;
+      return `copy ${op.model} ${idsLabel(idInfo ?? extractTargetIds(args))}${valsFieldList(def)}`;
+    }
+    case "message_post": {
+      const { ids } = extractTargetIds(args);
+      return `message_post on ${op.model}${ids.length ? ` id ${ids[0]}` : ""}`;
+    }
+    case "action_recalculate_handling_costs": {
+      const { ids } = extractTargetIds(args);
+      return `action_recalculate_handling_costs on ${op.model}${ids.length ? ` ids [${ids.join(", ")}]` : ""}`;
+    }
+    default:
+      return `${op.method} ${op.model}`;
+  }
+}
+
+function faultMessage(err: unknown): string {
+  if (err !== null && typeof err === "object") {
+    const anyErr = err as Record<string, unknown>;
+    if (typeof anyErr.faultString === "string" && anyErr.faultString.trim()) {
+      return anyErr.faultString;
+    }
+    if (typeof anyErr.message === "string" && anyErr.message.trim()) {
+      return anyErr.message;
+    }
+  }
+  return String(err);
+}
+
+const QUOTE_RPC_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+
+const QUOTE_RPC_DESCRIPTION =
+  "TEMPORARY scoped bridge to Odoo execute_kw for quote editing, run with the " +
+  "gateway's Odoo credentials. It exists ONLY until the deterministic tools " +
+  "replace it — update_quote and configure_addons (wave 2) and create_quote " +
+  "(wave 3); when those ship this bridge is removed, so prefer them if present.\n\n" +
+  "ALLOWED (model -> methods), enforced in plugin code before any RPC; anything " +
+  "else returns op_not_permitted:\n" +
+  "  - sale.order: create, write, copy, message_post, action_recalculate_handling_costs\n" +
+  "  - sale.order.line: write, unlink\n" +
+  "  - print.design: create, write, unlink\n" +
+  "  - product.template: message_post ONLY\n" +
+  "  - product.product: message_post ONLY\n" +
+  "There is NO create/write/unlink/copy on product.template, product.product or " +
+  "product.supplierinfo through this tool under any input. To create or change " +
+  "product data use odoo_spawn_customer_product / odoo_create_custom_product, or " +
+  "hand off to a human. print.design is the only product-adjacent write.\n\n" +
+  "BATCH: `ops` is an ordered array of {model, method, args, kwargs?}. `args` is " +
+  "the standard execute_kw positional array (create [{vals}]; write " +
+  "[[ids],{vals}]; unlink [[ids]]; copy [id] with optional kwargs.default; " +
+  "message_post [[id]] with kwargs such as {body, subtype_xmlid}; " +
+  "action_recalculate_handling_costs [[id]]). Ops run sequentially and STOP on " +
+  "the first error; there is NO cross-op transaction, so earlier ops stay " +
+  "committed if a later one fails — read results[].status.\n\n" +
+  "TWO-STEP FLOW: (1) call with dry_run:true to validate scope, get a " +
+  "human-readable `plan` (each write/unlink/copy op echoes its target records' " +
+  "id/display_name, plus state for sale.order) and a `plan_token`; ZERO writes " +
+  "occur. (2) after a human approves, call again with dry_run:false, the SAME " +
+  "ops, that plan_token, and a client_ref.\n\n" +
+  "NO DRIFT DETECTION: plan_token binds the ops' ARGS ONLY, never database " +
+  "state. It cannot tell whether the quote changed between approval and execute, " +
+  "so the calling skill MUST re-check for duplicates/state immediately before " +
+  "executing.\n\n" +
+  "IDEMPOTENCY: client_ref is required on execute. A repeat with the same " +
+  "client_ref and identical ops replays the stored result " +
+  "(idempotent_replay:true) without re-executing; the same client_ref with " +
+  "different ops returns client_ref_conflict. The store is in-memory and is " +
+  "cleared on gateway restart.\n\n" +
+  "Envelopes: errors -> {ok:false, errors:[{code, message, hint}]}; dry_run " +
+  "success -> {ok:true, dry_run:true, plan, plan_token}; execute success -> " +
+  "{ok:true, results:[...]}.";
+
+export function createOdooQuoteRpcTool(
+  cfg: OpenClawConfig,
+  clientOverride?: QuoteRpcClient,
+) {
+  const registeredAccount = resolveAccount(cfg);
+  const botSessionId = registeredAccount.botSessionId;
+
+  // client_ref -> {opsHash, response}. In-memory, TTL 24h, lazy eviction.
+  // Scoped to this tool instance; a gateway restart clears it (documented in
+  // the tool description). registerFull runs once per account boot, so in
+  // production this is a single store per gateway process.
+  const idempotencyStore = new Map<
+    string,
+    { opsHash: string; response: Record<string, unknown>; storedAt: number }
+  >();
+
+  const readStore = (ref: string) => {
+    const entry = idempotencyStore.get(ref);
+    if (!entry) return undefined;
+    if (Date.now() - entry.storedAt > QUOTE_RPC_IDEMPOTENCY_TTL_MS) {
+      idempotencyStore.delete(ref);
+      return undefined;
+    }
+    return entry;
+  };
+
+  return () => ({
+    name: "odoo_quote_rpc",
+    label: "Odoo Quote RPC (scoped bridge)",
+    description: QUOTE_RPC_DESCRIPTION,
+    parameters: Type.Object(
+      {
+        ops: Type.Array(
+          Type.Object(
+            {
+              model: Type.String({
+                description:
+                  "Odoo model. Allowed: sale.order, sale.order.line, " +
+                  "print.design (writes); product.template / product.product " +
+                  "(message_post only). Any other model -> op_not_permitted.",
+              }),
+              method: Type.String({
+                description:
+                  "Odoo method, allowlisted per model (see the scope table in " +
+                  "the tool description). Any other pair -> op_not_permitted.",
+              }),
+              args: Type.Array(Type.Unknown(), {
+                description:
+                  "Standard execute_kw positional args: create [{vals}]; " +
+                  "write [[ids],{vals}]; unlink [[ids]]; copy [id]; " +
+                  "message_post [[id]]; action_recalculate_handling_costs " +
+                  "[[id]].",
+              }),
+              kwargs: Type.Optional(
+                Type.Object(
+                  {},
+                  {
+                    // Passthrough bag for arbitrary Odoo kwargs — must stay
+                    // open (additionalProperties:true) to carry e.g.
+                    // {default:{...}} for copy or {body, subtype_xmlid} for
+                    // message_post. Structure is NOT validated here.
+                    additionalProperties: true,
+                    description:
+                      "Optional execute_kw keyword args, passed through " +
+                      'verbatim. E.g. {"default": {...}} for copy, or ' +
+                      '{"body": "…", "subtype_xmlid": "mail.mt_note"} for ' +
+                      "message_post.",
+                  },
+                ),
+              ),
+            },
+            { additionalProperties: false },
+          ),
+          {
+            minItems: 1,
+            description:
+              "Ordered batch of execute_kw operations. Run sequentially; " +
+              "execution STOPS on the first failure and earlier ops stay " +
+              "committed (no cross-op transaction).",
+          },
+        ),
+        dry_run: Type.Optional(
+          Type.Boolean({
+            description:
+              "Two-step approval. Call FIRST with dry_run:true to validate " +
+              "scope, get a human-readable `plan` (write/unlink/copy ops echo " +
+              "their target records) and a `plan_token`, with ZERO writes. " +
+              "After a human approves, call again with dry_run:false, the SAME " +
+              "ops, the plan_token, and a client_ref.",
+          }),
+        ),
+        plan_token: Type.Optional(
+          Type.String({
+            description:
+              "The plan_token from the matching dry_run. Required on execute " +
+              "(dry_run:false). It binds the ops' ARGS ONLY — not database " +
+              "state — so the calling skill must re-check for drift/duplicates " +
+              "immediately before executing. Missing -> plan_token_required; " +
+              "not matching the submitted ops -> plan_token_mismatch.",
+          }),
+        ),
+        client_ref: Type.Optional(
+          Type.String({
+            description:
+              "Idempotency key, REQUIRED on execute. A repeat with the same " +
+              "client_ref and identical ops replays the stored result " +
+              "(idempotent_replay:true) without re-executing; the same " +
+              "client_ref with different ops -> client_ref_conflict. The store " +
+              "is in-memory and cleared on gateway restart. Ignored by dry_run.",
+          }),
+        ),
+      },
+      { additionalProperties: false },
+    ),
+    execute: async (_toolCallId: string, params: QuoteRpcParams) => {
+      const client: QuoteRpcClient = clientOverride ?? getToolClient(cfg);
+      const ops: QuoteRpcOp[] = Array.isArray(params.ops) ? params.ops : [];
+
+      const wrap = (envelope: Record<string, unknown>) => ({
+        content: [
+          { type: "text" as const, text: JSON.stringify(envelope, null, 2) },
+        ],
+        details: undefined,
+      });
+
+      // Scope validation — shared by dry-run and execute (defense in depth on
+      // the execute path). All violations are reported at once.
+      const scopeViolations: Array<{
+        code: string;
+        message: string;
+        hint: string;
+      }> = [];
+      ops.forEach((op, index) => {
+        if (!isOpPermitted(op.model, op.method)) {
+          scopeViolations.push({
+            code: "op_not_permitted",
+            message: `op[${index}] ${op.model}.${op.method} is not permitted by odoo_quote_rpc`,
+            hint: opNotPermittedHint(op.model),
+          });
+        }
+      });
+
+      // -------------------------------- DRY RUN ------------------------------
+      if (params.dry_run === true) {
+        if (scopeViolations.length > 0) {
+          // Nothing is sent to Odoo if any op is out of scope.
+          return wrap({ ok: false, errors: scopeViolations });
+        }
+
+        const plan: Array<Record<string, unknown>> = [];
+        for (let index = 0; index < ops.length; index++) {
+          const op = ops[index];
+          const needsEcho =
+            op.method === "write" ||
+            op.method === "unlink" ||
+            op.method === "copy";
+          const idInfo = needsEcho ? extractTargetIds(op.args) : null;
+          const entry: Record<string, unknown> = {
+            index,
+            model: op.model,
+            method: op.method,
+            summary: summarizeOp(op, idInfo),
+          };
+          if (needsEcho) {
+            let targets: Array<Record<string, unknown>> = [];
+            if (idInfo && idInfo.ids.length > 0) {
+              const fields =
+                op.model === "sale.order"
+                  ? ["display_name", "state"]
+                  : ["display_name"];
+              const records = await client.searchRead({
+                model: op.model,
+                domain: [["id", "in", idInfo.ids]],
+                fields,
+                limit: idInfo.ids.length,
+                botSessionId,
+              });
+              targets = (records ?? []).map((r: Record<string, unknown>) => {
+                const t: Record<string, unknown> = {
+                  id: r.id,
+                  display_name: r.display_name,
+                };
+                if (op.model === "sale.order" && "state" in r) t.state = r.state;
+                return t;
+              });
+            }
+            entry.targets = targets;
+          }
+          plan.push(entry);
+        }
+
+        return wrap({
+          ok: true,
+          dry_run: true,
+          plan,
+          plan_token: computePlanToken(ops),
+        });
+      }
+
+      // -------------------------------- EXECUTE ------------------------------
+      if (!params.plan_token) {
+        return wrap({
+          ok: false,
+          errors: [
+            {
+              code: "plan_token_required",
+              message: "execute requires the plan_token from a prior dry_run",
+              hint:
+                "call this tool with dry_run:true over the SAME ops to get a " +
+                "plan_token, obtain human approval, then re-call with " +
+                "dry_run:false plus that token",
+            },
+          ],
+        });
+      }
+
+      const expectedToken = computePlanToken(ops);
+      if (params.plan_token !== expectedToken) {
+        return wrap({
+          ok: false,
+          errors: [
+            {
+              code: "plan_token_mismatch",
+              message: "plan_token does not match the submitted ops",
+              hint:
+                "the ops differ from the approved dry_run (the token binds " +
+                "args, not database state); re-run dry_run over the current " +
+                "ops and get fresh approval",
+            },
+          ],
+        });
+      }
+
+      if (!params.client_ref) {
+        return wrap({
+          ok: false,
+          errors: [
+            {
+              code: "client_ref_required",
+              message: "execute requires a client_ref idempotency key",
+              hint:
+                "supply a stable, unique client_ref (e.g. a task/row id) so a " +
+                "retried execute replays instead of re-running the ops",
+            },
+          ],
+        });
+      }
+
+      const opsHash = expectedToken;
+
+      // Idempotency — replay or conflict before any side effect.
+      const stored = readStore(params.client_ref);
+      if (stored) {
+        if (stored.opsHash === opsHash) {
+          return wrap({ ...stored.response, idempotent_replay: true });
+        }
+        return wrap({
+          ok: false,
+          errors: [
+            {
+              code: "client_ref_conflict",
+              message: "client_ref was already used with a different set of ops",
+              hint:
+                "this client_ref is bound to different ops; use a NEW " +
+                "client_ref for different work",
+            },
+          ],
+        });
+      }
+
+      // Defense in depth: re-validate scope before executing anything.
+      if (scopeViolations.length > 0) {
+        return wrap({ ok: false, errors: scopeViolations });
+      }
+
+      const results: Array<{
+        index: number;
+        model: string;
+        method: string;
+        status: "executed" | "failed" | "not_run";
+        result?: unknown;
+        error?: string;
+      }> = [];
+      let failure: string | null = null;
+
+      for (let index = 0; index < ops.length; index++) {
+        const op = ops[index];
+        if (failure !== null) {
+          results.push({
+            index,
+            model: op.model,
+            method: op.method,
+            status: "not_run",
+          });
+          continue;
+        }
+        try {
+          const result = await client.callMethod({
+            model: op.model,
+            method: op.method,
+            args: op.args,
+            kwargs: op.kwargs,
+            botSessionId,
+          });
+          results.push({
+            index,
+            model: op.model,
+            method: op.method,
+            status: "executed",
+            result,
+          });
+        } catch (err) {
+          failure = faultMessage(err);
+          results.push({
+            index,
+            model: op.model,
+            method: op.method,
+            status: "failed",
+            error: failure,
+          });
+        }
+      }
+
+      const response: Record<string, unknown> =
+        failure !== null
+          ? {
+              ok: false,
+              errors: [
+                {
+                  code: "execution_failed",
+                  message: failure,
+                  hint:
+                    "one op failed; prior ops in this batch are already " +
+                    "committed (no cross-op transaction) — inspect " +
+                    "results[].status, verify in Odoo, and use a NEW " +
+                    "client_ref for any corrected retry",
+                },
+              ],
+              results,
+            }
+          : { ok: true, results };
+
+      // Record for idempotent replay — on success AND mid-batch failure, since
+      // committed ops must not be re-run by a retry with the same client_ref.
+      idempotencyStore.set(params.client_ref, {
+        opsHash,
+        response,
+        storedAt: Date.now(),
+      });
+
+      return wrap(response);
     },
   });
 }

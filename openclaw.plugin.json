@@ -8,7 +8,8 @@
     "tools": [
       "odoo_search_read",
       "odoo_spawn_customer_product",
-      "odoo_create_custom_product"
+      "odoo_create_custom_product",
+      "odoo_quote_rpc"
     ]
   },
   "configSchema": {

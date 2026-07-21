@@ -17,6 +17,7 @@ import {
   createOdooSearchReadTool,
   createOdooSpawnCustomerProductTool,
   createOdooCreateCustomProductTool,
+  createOdooQuoteRpcTool,
 } from "./tools.js";
 import {
   CHANNEL_ID,
@@ -89,6 +90,11 @@ const entry: any = defineChannelPluginEntry({
     api.registerTool(
       createOdooCreateCustomProductTool(api.config),
       { name: "odoo_create_custom_product" },
+    );
+
+    api.registerTool(
+      createOdooQuoteRpcTool(api.config),
+      { name: "odoo_quote_rpc" },
     );
 
     const sideEffectsKey = channelSideEffectsKey(account);

@@ -15,6 +15,40 @@ export interface OdooConfig {
   db: string;
   uid: number;
   password: string;
+  /**
+   * Per-RPC timeout in ms for a single execute_kw call. A hung Odoo call
+   * rejects with {@link RpcTimeoutError} after this many ms instead of hanging
+   * the operation until the channel-level dispatch timeout. Defaults to
+   * {@link DEFAULT_RPC_TIMEOUT_MS} (120s). Resolved from
+   * `channels.odoo.rpcTimeoutMs`.
+   */
+  rpcTimeoutMs?: number;
+}
+
+/** Default per-RPC timeout (120s) when `channels.odoo.rpcTimeoutMs` is unset. */
+export const DEFAULT_RPC_TIMEOUT_MS = 120_000;
+
+/**
+ * Raised when a single execute_kw call exceeds the per-RPC timeout. Carries a
+ * stable `code` ("rpc_timeout") so callers (the odoo_quote_rpc bridge) can map
+ * it to a distinct per-op error code rather than the generic execution failure.
+ *
+ * A timeout means the write may or may not have landed on the Odoo side — the
+ * transport simply stopped waiting for the reply.
+ */
+export class RpcTimeoutError extends Error {
+  readonly code = "rpc_timeout";
+  constructor(
+    readonly model: string,
+    readonly method: string,
+    readonly timeoutMs: number,
+  ) {
+    super(
+      `odoo: XML-RPC ${model}.${method} timed out after ${timeoutMs}ms ` +
+        "(the write may or may not have landed)",
+    );
+    this.name = "RpcTimeoutError";
+  }
 }
 
 export interface CallReplyParams {
@@ -34,9 +68,11 @@ export interface CallReplyParams {
 export class OdooClient {
   private config: OdooConfig;
   private objectClient: any;
+  private rpcTimeoutMs: number;
 
   constructor(config: OdooConfig) {
     this.config = config;
+    this.rpcTimeoutMs = config.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
     const parsed = new URL(config.url);
     const isSecure = parsed.protocol === "https:";
     const port = parsed.port
@@ -58,6 +94,14 @@ export class OdooClient {
 
   /**
    * Call an Odoo model method via XML-RPC execute_kw.
+   *
+   * Bounded by a per-RPC timeout ({@link rpcTimeoutMs}): if the underlying
+   * XML-RPC call has not settled by then, the promise rejects with an
+   * {@link RpcTimeoutError} so a hung Odoo call can't stall the operation until
+   * the far larger channel-level dispatch timeout. A late callback arriving
+   * after the timeout is ignored (single-settle guard). No retry/backoff is
+   * added here — idempotency is the caller's concern (e.g. the bridge's
+   * client_ref).
    */
   private executeKw(
     model: string,
@@ -66,10 +110,20 @@ export class OdooClient {
     kwargs: Record<string, any> = {},
   ): Promise<any> {
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new RpcTimeoutError(model, method, this.rpcTimeoutMs));
+      }, this.rpcTimeoutMs);
+
       this.objectClient.methodCall(
         "execute_kw",
         [this.config.db, this.config.uid, this.config.password, model, method, args, kwargs],
         (err: Error | null, result: any) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
           if (err) reject(err);
           else resolve(result);
         },
@@ -149,6 +203,38 @@ export class OdooClient {
       kwargs.context = { bot_session_id: params.botSessionId };
     }
     return this.executeKw(params.model, "search_read", [params.domain], kwargs);
+  }
+
+  /**
+   * Call an arbitrary model method via XML-RPC execute_kw.
+   *
+   * Generic transport used by the product-creation agent tools: they call
+   * `agent.api` service methods (e.g. spawn_customer_product) whose single
+   * positional argument is the payload dict, and return the method's response
+   * envelope verbatim. `botSessionId` is merged into the call context the same
+   * way `callReply` does it — added to any caller-supplied context object
+   * without clobbering it (unlike `searchRead`, which overwrites context
+   * wholesale; here we preserve caller keys).
+   *
+   * Named `callMethod` rather than reusing the private `executeKw` name to
+   * avoid shadowing the raw transport while adding the context-injection layer.
+   */
+  async callMethod(params: {
+    model: string;
+    method: string;
+    args: any[];
+    kwargs?: Record<string, any>;
+    botSessionId?: string | null;
+  }): Promise<any> {
+    const kwargs: Record<string, any> = { ...(params.kwargs ?? {}) };
+    if (params.botSessionId) {
+      const existingContext =
+        kwargs.context && typeof kwargs.context === "object" && !Array.isArray(kwargs.context)
+          ? (kwargs.context as Record<string, any>)
+          : {};
+      kwargs.context = { ...existingContext, bot_session_id: params.botSessionId };
+    }
+    return this.executeKw(params.model, params.method, params.args, kwargs);
   }
 
   /**

@@ -13,7 +13,12 @@ import { createDedupeCache } from "openclaw/plugin-sdk/infra-runtime";
 import { createInboundDebouncer } from "openclaw/plugin-sdk/reply-runtime";
 import { odooPlugin, resolveAccount } from "./channel.js";
 import { setOdooRuntime } from "./runtime.js";
-import { createOdooSearchReadTool } from "./tools.js";
+import {
+  createOdooSearchReadTool,
+  createOdooSpawnCustomerProductTool,
+  createOdooCreateCustomProductTool,
+  createOdooQuoteRpcTool,
+} from "./tools.js";
 import {
   CHANNEL_ID,
   createDispatchHandler,
@@ -70,11 +75,27 @@ const entry: any = defineChannelPluginEntry({
       db: account.db,
       uid: account.uid,
       password: account.password,
+      rpcTimeoutMs: account.rpcTimeoutMs,
     };
 
     api.registerTool(
       createOdooSearchReadTool(api.config),
       { name: "odoo_search_read" },
+    );
+
+    api.registerTool(
+      createOdooSpawnCustomerProductTool(api.config),
+      { name: "odoo_spawn_customer_product" },
+    );
+
+    api.registerTool(
+      createOdooCreateCustomProductTool(api.config),
+      { name: "odoo_create_custom_product" },
+    );
+
+    api.registerTool(
+      createOdooQuoteRpcTool(api.config),
+      { name: "odoo_quote_rpc" },
     );
 
     const sideEffectsKey = channelSideEffectsKey(account);

@@ -5,7 +5,12 @@
   "name": "Odoo",
   "description": "Route AI conversations through Odoo chatter via XML-RPC",
   "contracts": {
-    "tools": ["odoo_search_read"]
+    "tools": [
+      "odoo_search_read",
+      "odoo_spawn_customer_product",
+      "odoo_create_custom_product",
+      "odoo_quote_rpc"
+    ]
   },
   "configSchema": {
     "type": "object",

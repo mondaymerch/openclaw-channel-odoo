@@ -14,7 +14,7 @@ import {
 } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import { runStoppablePassiveMonitor } from "openclaw/plugin-sdk/extension-shared";
-import { OdooClient, type OdooConfig } from "./client.js";
+import { DEFAULT_RPC_TIMEOUT_MS, OdooClient, type OdooConfig } from "./client.js";
 import {
   HARD_TIMEOUT_MS,
   INBOUND_DEBOUNCE_MS,
@@ -95,6 +95,10 @@ export interface ResolvedOdooAccount {
   maxProcessRssMb: number;
   /** Optional event-loop p99 delay admission limit. 0 disables the check. */
   maxEventLoopDelayMs: number;
+  /** Per-RPC timeout for a single execute_kw call, in ms. Bounds a hung Odoo
+   *  call so it can't stall an op until agentTimeoutMs. Defaults to
+   *  DEFAULT_RPC_TIMEOUT_MS (120_000 = 120s). */
+  rpcTimeoutMs: number;
 }
 
 // Per-account client cache
@@ -401,6 +405,14 @@ export function resolveAccount(
     min: 0,
     max: 60_000,
   });
+  const rpcTimeoutMs = readBoundedInt(section.rpcTimeoutMs, {
+    field: "rpcTimeoutMs",
+    default: DEFAULT_RPC_TIMEOUT_MS,
+    // >=1s so a real Odoo call has a chance; capped at 10min — a single RPC
+    // taking longer than that indicates a stuck call the op should abandon.
+    min: 1_000,
+    max: 600_000,
+  });
 
   return {
     accountId: _accountId ?? null,
@@ -420,6 +432,7 @@ export function resolveAccount(
     minDispatchSpacingMs,
     maxProcessRssMb,
     maxEventLoopDelayMs,
+    rpcTimeoutMs,
   };
 }
 
@@ -504,6 +517,7 @@ export const odooPlugin = createChatChannelPlugin<ResolvedOdooAccount>({
           db: account.db,
           uid: account.uid,
           password: account.password,
+          rpcTimeoutMs: account.rpcTimeoutMs,
         });
 
         const target = String(ctx.threadId ?? ctx.to ?? "");

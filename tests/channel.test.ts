@@ -13,6 +13,7 @@ import {
   findRouteForInbound,
   resolveAccount,
 } from "../src/channel.js";
+import { DEFAULT_RPC_TIMEOUT_MS } from "../src/client.js";
 import {
   HARD_TIMEOUT_MS,
   INBOUND_DEBOUNCE_MS,
@@ -134,6 +135,41 @@ test("agentTimeoutMs > REPLAY_TTL_MS is rejected (would let TTL fire before time
 test("agentTimeoutMs exactly at REPLAY_TTL_MS is accepted (boundary)", () => {
   const account = resolveAccount(buildCfg({ agentTimeoutMs: REPLAY_TTL_MS }));
   assert.equal(account.agentTimeoutMs, REPLAY_TTL_MS);
+});
+
+// ===========================================================================
+// rpcTimeoutMs — per-RPC timeout knob
+// ===========================================================================
+
+test("rpcTimeoutMs defaults to DEFAULT_RPC_TIMEOUT_MS when omitted", () => {
+  const account = resolveAccount(buildCfg());
+  assert.equal(account.rpcTimeoutMs, DEFAULT_RPC_TIMEOUT_MS);
+});
+
+test("rpcTimeoutMs override is surfaced on the resolved account", () => {
+  const account = resolveAccount(buildCfg({ rpcTimeoutMs: 30_000 }));
+  assert.equal(account.rpcTimeoutMs, 30_000);
+});
+
+test("rpcTimeoutMs: below 1000 is rejected", () => {
+  assert.throws(
+    () => resolveAccount(buildCfg({ rpcTimeoutMs: 999 })),
+    /rpcTimeoutMs: must be an integer in \[1000, 600000\]/,
+  );
+});
+
+test("rpcTimeoutMs: above 600000 is rejected", () => {
+  assert.throws(
+    () => resolveAccount(buildCfg({ rpcTimeoutMs: 600_001 })),
+    /rpcTimeoutMs: must be an integer in \[1000, 600000\]/,
+  );
+});
+
+test("rpcTimeoutMs: non-integer is rejected", () => {
+  assert.throws(
+    () => resolveAccount(buildCfg({ rpcTimeoutMs: 1500.5 })),
+    /rpcTimeoutMs: must be an integer/,
+  );
 });
 
 // ===========================================================================

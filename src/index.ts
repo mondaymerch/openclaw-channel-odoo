@@ -75,6 +75,7 @@ const entry: any = defineChannelPluginEntry({
       db: account.db,
       uid: account.uid,
       password: account.password,
+      rpcTimeoutMs: account.rpcTimeoutMs,
     };
 
     api.registerTool(

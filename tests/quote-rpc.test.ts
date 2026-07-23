@@ -742,6 +742,105 @@ test("computePlanToken: stable regardless of op key order", () => {
   assert.equal(a, b);
 });
 
+// --------------------------------------------------------------------------
+// Per-RPC timeout — a hung execute_kw surfaces as an rpc_timeout op error
+// through the bridge, with per-op status semantics preserved.
+//
+// The failing op is driven by a REAL OdooClient with a short rpcTimeoutMs and a
+// transport whose methodCall never invokes its callback, so executeKw rejects
+// with RpcTimeoutError, which the bridge maps to code rpc_timeout.
+// --------------------------------------------------------------------------
+
+// A real client whose XML-RPC transport never settles. `calls` counts how many
+// times the transport was actually invoked (to prove not_run / replay).
+function makeHangingClient(rpcTimeoutMs: number) {
+  const state = { calls: 0 };
+  const client = new OdooClient({
+    url: "https://x.invalid",
+    db: "d",
+    uid: 7,
+    password: "p",
+    rpcTimeoutMs,
+  });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (client as any).objectClient = {
+    methodCall: () => {
+      state.calls += 1;
+      // never calls the callback -> executeKw times out
+    },
+  };
+  return { client, state };
+}
+
+test("execute: a hung RPC yields rpc_timeout; failing op failed, later op not_run", async () => {
+  const { client, state } = makeHangingClient(20);
+  const tool = createOdooQuoteRpcTool(cfg, client)();
+  const ops = [
+    { model: "sale.order", method: "write", args: [[1], { note: "x" }] },
+    { model: "sale.order", method: "message_post", args: [[1]], kwargs: { body: "later" } },
+  ];
+  const env = await run(tool, {
+    ops,
+    plan_token: computePlanToken(ops),
+    client_ref: "cref-timeout-1",
+  });
+
+  assert.equal(env.ok, false);
+  assert.equal(env.errors.length, 1);
+  assert.equal(env.errors[0].code, "rpc_timeout");
+  // hint tells the skill the write may or may not have landed + how to retry
+  assert.match(env.errors[0].hint, /verify actual state via odoo_search_read/);
+  assert.match(env.errors[0].hint, /NEW client_ref/);
+
+  // per-op statuses: op0 timed out (failed), op1 never attempted
+  assert.equal(env.results[0].status, "failed");
+  assert.equal(env.results[1].status, "not_run");
+  // only op0 reached the transport
+  assert.equal(state.calls, 1);
+});
+
+test("execute: a stored rpc_timeout replays on the SAME client_ref without re-issuing the RPC", async () => {
+  const { client, state } = makeHangingClient(20);
+  const tool = createOdooQuoteRpcTool(cfg, client)();
+  const ops = [{ model: "sale.order", method: "write", args: [[1], {}] }];
+  const token = computePlanToken(ops);
+
+  const first = await run(tool, { ops, plan_token: token, client_ref: "cref-timeout-replay" });
+  assert.equal(first.ok, false);
+  assert.equal(first.errors[0].code, "rpc_timeout");
+  assert.equal(state.calls, 1);
+
+  // Same client_ref replays the stored failure by design (the documented reason
+  // a corrected retry must use a NEW client_ref).
+  const replay = await run(tool, { ops, plan_token: token, client_ref: "cref-timeout-replay" });
+  assert.equal(replay.ok, false);
+  assert.equal(replay.idempotent_replay, true);
+  assert.equal(replay.errors[0].code, "rpc_timeout");
+  assert.equal(state.calls, 1, "replay must NOT re-issue the RPC");
+});
+
+test("execute: a NON-timeout Odoo fault still maps to execution_failed (not rpc_timeout)", async () => {
+  // Guards the timeout classification: only RpcTimeoutError becomes rpc_timeout.
+  const stub = makeStub({
+    callMethod: () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const e: any = new Error("boom");
+      e.faultString = "Odoo: validation error";
+      throw e;
+    },
+  });
+  const tool = newTool(stub.client);
+  const ops = [{ model: "sale.order", method: "write", args: [[1], {}] }];
+  const env = await run(tool, {
+    ops,
+    plan_token: computePlanToken(ops),
+    client_ref: "cref-fault-1",
+  });
+  assert.equal(env.ok, false);
+  assert.equal(env.errors[0].code, "execution_failed");
+  assert.equal(env.errors[0].message, "Odoo: validation error");
+});
+
 test("tool identity: name and label are stable", () => {
   const tool = newTool(makeStub().client);
   assert.equal(tool.name, "odoo_quote_rpc");

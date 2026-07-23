@@ -6,6 +6,83 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-07-23
+
+### Changed
+
+- **Agent-tool terminology corrected: `plan_token` is a consistency hash, not
+  approval evidence.** The two-step dry-run/execute flow was documented as an
+  "approval flow" whose token recorded "what a human approved" — a false claim
+  about the token's security meaning. `plan_token` is a deterministic sha256 of
+  the canonical ops; it binds the call ARGS ONLY (never database state) and is
+  neither a record of human review nor an authorization boundary. Its sole
+  guarantee is consistency: a matching token on execute proves what runs is
+  exactly what the dry-run validated. All three agent tools
+  (`odoo_spawn_customer_product`, `odoo_create_custom_product`, `odoo_quote_rpc`)
+  and their field/hint text now describe a "plan-validation flow". No behaviour
+  change — token mechanics (dry-run returns it, execute requires a match,
+  `plan_token_required` / `plan_token_mismatch`) are unchanged.
+
+- **`odoo_quote_rpc` labelled accurately as a scoped XML-RPC bridge.** Its
+  description and header comment now open with "scoped XML-RPC bridge: a
+  model/method-allowlisted `execute_kw` passthrough using gateway-held
+  credentials", and state explicitly that within the permitted models the agent
+  constructs general args (data-level, not action-level access), that
+  product-data writes are impossible both directly and through nested x2many
+  command cascades, and that the two typed tools are the only product-creation
+  route.
+
+### Added
+
+- **Per-RPC timeout (`channels.odoo.rpcTimeoutMs`, default 120000).**
+  `OdooClient.executeKw` previously wrapped the XML-RPC `methodCall` with no
+  timeout, so a hung Odoo call stalled the operation until the far larger
+  channel-level dispatch timeout (`agentTimeoutMs`, up to 1 h). Each `execute_kw`
+  is now bounded: an unsettled call rejects with a structured `RpcTimeoutError`
+  after `rpcTimeoutMs` (range `[1000, 600000]`). A late transport callback
+  arriving after the timeout is ignored (single-settle guard). Through the
+  `odoo_quote_rpc` bridge this surfaces as an `rpc_timeout` op error with
+  unchanged per-op status semantics (prior ops `executed`, the timed-out op
+  `failed`, later ops `not_run`). Its hint notes the write may or may not have
+  landed — verify state via `odoo_search_read` and retry with a NEW `client_ref`
+  (the old ref replays the stored failure by design). No retry/backoff is added;
+  `client_ref` idempotency plus skill-side verification is the deliberate model.
+
+## [0.6.0] — 2026-07-21
+
+### Added
+
+- **`odoo_quote_rpc` — TEMPORARY scoped `execute_kw` bridge for quote editing**
+  (commit `9c346b9`). A model/method-allowlisted passthrough that runs Odoo
+  `execute_kw` with the gateway's credentials, but ONLY for the (model, method)
+  pairs in a hardcoded `QUOTE_RPC_SCOPE` (`sale.order` create/write/copy/
+  message_post/action_recalculate_handling_costs; `sale.order.line`
+  write/unlink; `print.design` create/write/unlink; `product.template` /
+  `product.product` message_post only), enforced in plugin code before any RPC
+  leaves the process. A hard-forbidden gate (`product.template` /
+  `product.product` / `product.supplierinfo` ×
+  create/write/unlink/copy/name_create/copy_data/load) runs FIRST so a mistaken
+  scope-table edit can't open a product write. Two-step plan-validation flow with
+  a sha256 `plan_token` (args-only consistency hash, no drift detection) and a
+  required `client_ref` idempotency key (in-memory, 24 h TTL, cleared on
+  restart); batches run sequentially and STOP on the first error with per-op
+  `executed` / `failed` / `not_run` status. Exists only until the deterministic
+  tools (`update_quote` / `configure_addons` wave 2, `create_quote` wave 3)
+  replace it.
+
+### Fixed
+
+- **x2many command-cascade guard closes a product-write bypass** (commit
+  `424bf2a`). The (model, method) allowlist alone was insufficient: Odoo cascades
+  x2many command tuples inside `vals` onto the comodel below `execute_kw`, so a
+  permitted `sale.order` write/create carrying
+  `{"product_to_archive_ids": [[0,0,{…,"seller_ids":[[0,0,{}]]}]]}` would be full
+  product CRUD. The bridge now recursively scans op args/kwargs and rejects any
+  comodel-mutating command (codes 0/1/2/5) with `unsafe_relational_write`; the
+  one exception is `order_line` creation on `sale.order.create`, whose line vals
+  are scanned the same way. Relation-only commands (link / unlink-relation /
+  replace, codes 3/4/6) are allowed.
+
 ## [0.5.0] — 2026-07-17
 
 ### Added
@@ -23,8 +100,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   pattern: they forward the payload as the single positional argument to the
   `agent.api` method and return its structured response envelope VERBATIM
   (never transformed, `ok:false` failures never swallowed). All validation,
-  dedup, dry-run/approval, idempotency and VAT/price correctness live in the
-  Odoo method. TypeBox schemas enforce structure/type/required/enums and
+  dedup, dry-run plan-validation, idempotency and VAT/price correctness live in
+  the Odoo method. TypeBox schemas enforce structure/type/required/enums and
   `additionalProperties: false` (blocking fields the agent must never pass, e.g.
   `partner`, `list_price`); value semantics are validated server-side so every
   problem is returned in one response.

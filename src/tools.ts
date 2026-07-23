@@ -8,8 +8,9 @@
  *                                  from a purchasing spec (agent.api).
  *
  * The two product-creation tools are thin transport: all business logic
- * (validation, dedup, dry-run/approval, idempotency, VAT/price correctness)
- * lives in the `agent.api` Odoo model. These tools forward the payload as the
+ * (validation, dedup, dry-run plan-validation, idempotency, VAT/price
+ * correctness) lives in the `agent.api` Odoo model. These tools forward the
+ * payload as the
  * single positional argument and return the response envelope VERBATIM —
  * they never transform it and never swallow an `ok:false` failure, because the
  * structured error envelope is designed for the agent itself to read and act
@@ -32,7 +33,7 @@
 import { createHash } from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
-import { OdooClient } from "./client.js";
+import { OdooClient, RpcTimeoutError } from "./client.js";
 import { resolveAccount } from "./channel.js";
 
 // Reuse cached clients
@@ -48,6 +49,7 @@ function getToolClient(cfg: OpenClawConfig): OdooClient {
       db: account.db,
       uid: account.uid,
       password: account.password,
+      rpcTimeoutMs: account.rpcTimeoutMs,
     });
     toolClients.set(key, client);
   }
@@ -133,15 +135,20 @@ export function createOdooSearchReadTool(cfg: OpenClawConfig) {
 }
 
 // Shared field fragments (declared once so both product tools document the
-// two-step approval flow and idempotency identically).
+// two-step plan-validation flow and idempotency identically).
 
 const dryRunField = Type.Optional(
   Type.Boolean({
     description:
-      "Two-step approval flow. Call FIRST with dry_run:true to get a preview " +
-      "`plan` plus a `plan_token`, and ZERO writes. After a human approves the " +
-      "plan, call again with dry_run:false, the SAME payload, plus that " +
-      "plan_token to execute.",
+      "Two-step plan-validation flow. Call FIRST with dry_run:true — the tool " +
+      "validates every op, reports all problems at once, and returns the " +
+      "normalized `plan` plus a `plan_token`, with ZERO writes. The plan_token " +
+      "is a deterministic sha256 of the canonical ops — a consistency check " +
+      "binding args only, NOT a record of human review and NOT an " +
+      "authorization boundary. Review the returned plan against the request, " +
+      "then call again with dry_run:false, the SAME payload, plus that " +
+      "plan_token to execute — guaranteeing what executes is exactly what was " +
+      "validated.",
   }),
 );
 
@@ -160,10 +167,10 @@ const planTokenField = Type.Optional(
   Type.String({
     description:
       "The sha256 plan_token returned by the matching dry_run call. Required on " +
-      "execute while server-side approval is enabled for this action (the " +
-      "default). It guarantees that what the human approved is exactly what " +
-      "executes; a wrong/absent token returns plan_token_mismatch/" +
-      "plan_token_required.",
+      "execute. It is a consistency hash of the ops' args (NOT a record of " +
+      "human review and NOT an authorization boundary); a matching token " +
+      "guarantees what executes is exactly what was validated in the dry_run. A " +
+      "wrong/absent token returns plan_token_mismatch/plan_token_required.",
   }),
 );
 
@@ -205,10 +212,12 @@ export function createOdooSpawnCustomerProductTool(cfg: OpenClawConfig) {
       "Spawn a platform-bound CUSTOMER product (a child of a catalogue parent " +
       "template) for one customer, via the transactional agent.api service. " +
       "The tool enforces reuse-first dedup, validity gates and the two-step " +
-      "dry-run/approval flow server-side and returns a structured response " +
-      "envelope (never a raw traceback). ALWAYS call with dry_run:true first, " +
-      "present the returned plan to a human, then execute with the plan_token. " +
-      "When target_so is set, the appended line's partner is always derived " +
+      "dry-run plan-validation flow server-side and returns a structured " +
+      "response envelope (never a raw traceback). ALWAYS call with dry_run:true " +
+      "first, review the returned plan against the request, then execute with " +
+      "the plan_token (a consistency hash of the args, not evidence of human " +
+      "review). When target_so is set, the appended line's partner is always " +
+      "derived " +
       "from that SO server-side — never attempt to pass a partner. For an " +
       "out-of-catalogue product with no parent, use odoo_create_custom_product " +
       "instead.",
@@ -295,11 +304,12 @@ export function createOdooCreateCustomProductTool(cfg: OpenClawConfig) {
       "purchasing spec, via the transactional agent.api service. The tool " +
       "creates the product.template + product.supplierinfo, derives the sale " +
       "price from cost × sales_factor, resolves company/currency/vendor " +
-      "server-side, and enforces the two-step dry-run/approval flow. It returns " +
-      "a structured response envelope (never a raw traceback). ALWAYS call with " +
-      "dry_run:true first, present the plan (including its warnings) to a human, " +
-      "then execute with the plan_token. To spawn a catalogue child instead, " +
-      "use odoo_spawn_customer_product.",
+      "server-side, and enforces the two-step dry-run plan-validation flow. It " +
+      "returns a structured response envelope (never a raw traceback). ALWAYS " +
+      "call with dry_run:true first, review the plan (including its warnings) " +
+      "against the request, then execute with the plan_token (a consistency " +
+      "hash of the args, not evidence of human review). To spawn a catalogue " +
+      "child instead, use odoo_spawn_customer_product.",
     parameters: Type.Object(
       {
         name: Type.String({
@@ -513,14 +523,27 @@ export function createOdooCreateCustomProductTool(cfg: OpenClawConfig) {
 }
 
 // ===========================================================================
-// odoo_quote_rpc — TEMPORARY scoped execute_kw bridge for quote editing.
+// odoo_quote_rpc — TEMPORARY scoped XML-RPC bridge for quote editing: a
+// model/method-allowlisted execute_kw passthrough using gateway-held Odoo
+// credentials.
 //
-// A passthrough that runs Odoo execute_kw with the gateway's credentials, but
-// ONLY for the (model, method) pairs in QUOTE_RPC_SCOPE, enforced here in
-// plugin code before any RPC leaves the process. It is deliberately a bridge:
-// each operation migrates to a dedicated deterministic tool (update_quote /
-// configure_addons in wave 2, create_quote in wave 3) and this tool is removed
-// once they ship.
+// It runs execute_kw ONLY for the (model, method) pairs in QUOTE_RPC_SCOPE,
+// enforced here in plugin code before any RPC leaves the process. Within those
+// permitted models the agent constructs general execute_kw args — this is
+// DATA-LEVEL access (which records/fields), not ACTION-level access (a fixed
+// set of typed operations). Product data writes are impossible through it, both
+// directly (product.template / product.product / product.supplierinfo
+// create/write/unlink/copy are hard-forbidden) AND through nested x2many
+// command cascades (see the cascade guard below); the two typed tools
+// (odoo_spawn_customer_product / odoo_create_custom_product) remain the ONLY
+// product-creation route.
+//
+// It is deliberately a bridge with planned expiry: each operation migrates to a
+// dedicated deterministic tool (update_quote / configure_addons in wave 2,
+// create_quote in wave 3) and this tool is removed once they ship.
+//
+// The plan_token binds the ops' ARGS ONLY — it is a consistency hash, NOT drift
+// detection and NOT a human-authorization gate (see computePlanToken).
 //
 // The scope table is hardcoded on purpose — widening what the agent can write
 // is always a reviewed plugin release, never a config or prompt change.
@@ -866,11 +889,31 @@ function faultMessage(err: unknown): string {
 
 const QUOTE_RPC_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 
+// Hint for a per-RPC timeout (RpcTimeoutError from the client). A timeout is
+// ambiguous — the write may or may not have committed on the Odoo side — so the
+// skill must verify actual state before any retry, and MUST use a new
+// client_ref (the old ref replays this stored failure by design; it never
+// re-runs the ops).
+const RPC_TIMEOUT_HINT =
+  "the Odoo call exceeded the per-RPC timeout; the write may or may not have " +
+  "landed — verify actual state via odoo_search_read before retrying, and " +
+  "retry with a NEW client_ref (the old ref replays this stored failure by " +
+  "design)";
+
+// Hint for a non-timeout op failure (an Odoo fault / validation error).
+const EXECUTION_FAILED_HINT =
+  "one op failed; prior ops in this batch are already committed (no cross-op " +
+  "transaction) — inspect results[].status, verify in Odoo, and use a NEW " +
+  "client_ref for any corrected retry";
+
 const QUOTE_RPC_DESCRIPTION =
-  "TEMPORARY scoped bridge to Odoo execute_kw for quote editing, run with the " +
-  "gateway's Odoo credentials. It exists ONLY until the deterministic tools " +
-  "replace it — update_quote and configure_addons (wave 2) and create_quote " +
-  "(wave 3); when those ship this bridge is removed, so prefer them if present.\n\n" +
+  "TEMPORARY scoped XML-RPC bridge for quote editing: a model/method-" +
+  "allowlisted execute_kw passthrough run with the gateway's Odoo credentials. " +
+  "Within the permitted models you construct general execute_kw args — this is " +
+  "DATA-LEVEL access (which records/fields), not a fixed set of typed actions. " +
+  "It exists ONLY until the deterministic tools replace it — update_quote and " +
+  "configure_addons (wave 2) and create_quote (wave 3); when those ship this " +
+  "bridge is removed, so prefer them if present.\n\n" +
   "ALLOWED (model -> methods), enforced in plugin code before any RPC; anything " +
   "else returns op_not_permitted:\n" +
   "  - sale.order: create, write, copy, message_post, action_recalculate_handling_costs\n" +
@@ -880,8 +923,9 @@ const QUOTE_RPC_DESCRIPTION =
   "  - product.product: message_post ONLY\n" +
   "There is NO create/write/unlink/copy on product.template, product.product or " +
   "product.supplierinfo through this tool under any input. To create or change " +
-  "product data use odoo_spawn_customer_product / odoo_create_custom_product, or " +
-  "hand off to a human. print.design is the only product-adjacent write.\n\n" +
+  "product data use odoo_spawn_customer_product / odoo_create_custom_product " +
+  "(the only product-creation route), or hand off to a human. print.design is " +
+  "the only product-adjacent write.\n\n" +
   "NESTED WRITES: x2many command tuples in vals that CREATE/UPDATE/DELETE " +
   "related records (command codes 0/1/2/5) are rejected (unsafe_relational_write) " +
   "— they would cascade onto comodels (e.g. product.template via " +
@@ -896,20 +940,32 @@ const QUOTE_RPC_DESCRIPTION =
   "action_recalculate_handling_costs [[id]]). Ops run sequentially and STOP on " +
   "the first error; there is NO cross-op transaction, so earlier ops stay " +
   "committed if a later one fails — read results[].status.\n\n" +
-  "TWO-STEP FLOW: (1) call with dry_run:true to validate scope, get a " +
-  "human-readable `plan` (each write/unlink/copy op echoes its target records' " +
-  "id/display_name, plus state for sale.order) and a `plan_token`; ZERO writes " +
-  "occur. (2) after a human approves, call again with dry_run:false, the SAME " +
-  "ops, that plan_token, and a client_ref.\n\n" +
-  "NO DRIFT DETECTION: plan_token binds the ops' ARGS ONLY, never database " +
-  "state. It cannot tell whether the quote changed between approval and execute, " +
-  "so the calling skill MUST re-check for duplicates/state immediately before " +
+  "TWO-STEP PLAN-VALIDATION FLOW: (1) call with dry_run:true — the tool " +
+  "validates every op's scope and safety, reports all problems at once, and " +
+  "returns a human-readable `plan` (each write/unlink/copy op echoes its target " +
+  "records' id/display_name, plus state for sale.order) and a `plan_token`; " +
+  "ZERO writes occur. (2) review the returned plan and warnings against the " +
+  "request; then call again with dry_run:false, the SAME ops, that plan_token, " +
+  "and a client_ref — the matching token guarantees what executes is exactly " +
+  "what was validated.\n\n" +
+  "PLAN_TOKEN — CONSISTENCY CHECK, NOT A HUMAN GATE: plan_token is a " +
+  "deterministic sha256 of the canonical ops. It binds the ops' ARGS ONLY — " +
+  "never database state — and does NOT record human review nor act as an " +
+  "authorization boundary. It cannot tell whether the quote changed between " +
+  "dry_run and execute, so the " +
+  "calling skill MUST re-check for duplicates/state immediately before " +
   "executing.\n\n" +
   "IDEMPOTENCY: client_ref is required on execute. A repeat with the same " +
   "client_ref and identical ops replays the stored result " +
   "(idempotent_replay:true) without re-executing; the same client_ref with " +
   "different ops returns client_ref_conflict. The store is in-memory and is " +
-  "cleared on gateway restart.\n\n" +
+  "cleared on gateway restart. There is NO automatic retry/backoff — client_ref " +
+  "idempotency plus skill-side verification is the deliberate model.\n\n" +
+  "PER-RPC TIMEOUT: each execute_kw is bounded by a per-RPC timeout (config " +
+  "channels.odoo.rpcTimeoutMs, default 120s). A hung op fails with rpc_timeout " +
+  "(prior ops executed, later ops not_run); the write may or may not have " +
+  "landed, so verify state via odoo_search_read and retry with a NEW client_ref " +
+  "(the old ref replays the stored failure by design).\n\n" +
   "Envelopes: errors -> {ok:false, errors:[{code, message, hint}]}; dry_run " +
   "success -> {ok:true, dry_run:true, plan, plan_token}; execute success -> " +
   "{ok:true, results:[...]}.";
@@ -998,21 +1054,24 @@ export function createOdooQuoteRpcTool(
         dry_run: Type.Optional(
           Type.Boolean({
             description:
-              "Two-step approval. Call FIRST with dry_run:true to validate " +
-              "scope, get a human-readable `plan` (write/unlink/copy ops echo " +
-              "their target records) and a `plan_token`, with ZERO writes. " +
-              "After a human approves, call again with dry_run:false, the SAME " +
-              "ops, the plan_token, and a client_ref.",
+              "Two-step plan-validation flow. Call FIRST with dry_run:true to " +
+              "validate every op, get a human-readable `plan` (write/unlink/copy " +
+              "ops echo their target records) and a `plan_token`, with ZERO " +
+              "writes. Then review the plan against the request and call again " +
+              "with dry_run:false, the SAME ops, the plan_token, and a " +
+              "client_ref.",
           }),
         ),
         plan_token: Type.Optional(
           Type.String({
             description:
               "The plan_token from the matching dry_run. Required on execute " +
-              "(dry_run:false). It binds the ops' ARGS ONLY — not database " +
-              "state — so the calling skill must re-check for drift/duplicates " +
-              "immediately before executing. Missing -> plan_token_required; " +
-              "not matching the submitted ops -> plan_token_mismatch.",
+              "(dry_run:false). It is a consistency hash of the ops' ARGS ONLY " +
+              "(not database state, not evidence of human review) — so the " +
+              "calling skill must re-check for drift/duplicates immediately " +
+              "before " +
+              "executing. Missing -> plan_token_required; not matching the " +
+              "submitted ops -> plan_token_mismatch.",
           }),
         ),
         client_ref: Type.Optional(
@@ -1125,7 +1184,7 @@ export function createOdooQuoteRpcTool(
               message: "execute requires the plan_token from a prior dry_run",
               hint:
                 "call this tool with dry_run:true over the SAME ops to get a " +
-                "plan_token, obtain human approval, then re-call with " +
+                "plan_token, review the returned plan, then re-call with " +
                 "dry_run:false plus that token",
             },
           ],
@@ -1141,9 +1200,9 @@ export function createOdooQuoteRpcTool(
               code: "plan_token_mismatch",
               message: "plan_token does not match the submitted ops",
               hint:
-                "the ops differ from the approved dry_run (the token binds " +
+                "the ops differ from the validated dry_run (the token binds " +
                 "args, not database state); re-run dry_run over the current " +
-                "ops and get fresh approval",
+                "ops and use the fresh plan_token",
             },
           ],
         });
@@ -1201,6 +1260,9 @@ export function createOdooQuoteRpcTool(
         error?: string;
       }> = [];
       let failure: string | null = null;
+      // Distinguish a per-RPC timeout (ambiguous — write may have landed) from
+      // an ordinary Odoo fault, so the failing op surfaces the right code/hint.
+      let failureIsTimeout = false;
 
       for (let index = 0; index < ops.length; index++) {
         const op = ops[index];
@@ -1230,6 +1292,7 @@ export function createOdooQuoteRpcTool(
           });
         } catch (err) {
           failure = faultMessage(err);
+          failureIsTimeout = err instanceof RpcTimeoutError;
           results.push({
             index,
             model: op.model,
@@ -1245,15 +1308,17 @@ export function createOdooQuoteRpcTool(
           ? {
               ok: false,
               errors: [
-                {
-                  code: "execution_failed",
-                  message: failure,
-                  hint:
-                    "one op failed; prior ops in this batch are already " +
-                    "committed (no cross-op transaction) — inspect " +
-                    "results[].status, verify in Odoo, and use a NEW " +
-                    "client_ref for any corrected retry",
-                },
+                failureIsTimeout
+                  ? {
+                      code: "rpc_timeout",
+                      message: failure,
+                      hint: RPC_TIMEOUT_HINT,
+                    }
+                  : {
+                      code: "execution_failed",
+                      message: failure,
+                      hint: EXECUTION_FAILED_HINT,
+                    },
               ],
               results,
             }

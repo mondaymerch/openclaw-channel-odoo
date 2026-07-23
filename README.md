@@ -62,11 +62,15 @@ Minimal `openclaw.json`:
       //   maxProcessRssMb / maxEventLoopDelayMs:
       //                   optional process-health admission limits. Default 0
       //                   disables each check.
+      //   rpcTimeoutMs:   per-RPC timeout for a single execute_kw call. Bounds
+      //                   a hung Odoo call so it can't stall an op until
+      //                   agentTimeoutMs. Range [1000, 600000]. Default 120000.
       "debounceMs": 3000,
       "agentTimeoutMs": 900000,
       "maxConcurrentDispatches": 1,
       "minDispatchSpacingMs": 5000,
       "dispatchAdmissionRetryMs": 15000,
+      "rpcTimeoutMs": 120000,
 
       "routes": [
         {
